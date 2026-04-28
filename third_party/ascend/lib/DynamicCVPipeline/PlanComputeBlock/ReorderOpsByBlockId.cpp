@@ -20,6 +20,8 @@
  * THE SOFTWARE.
  */
 
+#include <utility>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/iterator.h"
@@ -54,18 +56,101 @@ namespace {
 
 // A dependency DAG of both SSA and memory of the ops
 struct BlockOpGraph {
-    SmallVector<Operation *> ops;
+    ArrayRef<Operation *> ops;
     DenseMap<Operation *, unsigned> opIndex;               // op → position in ops
     DenseMap<Operation *, SmallVector<Operation *>> preds; // op → its defs
     DenseMap<Operation *, SmallVector<Operation *>> succs; // op → its uses
-    BlockOpGraph(Block *block, const MemoryDependenceGraph &memGraph);
+    BlockOpGraph(ArrayRef<Operation *> allOps, Block *block, const MemoryDependenceGraph &memGraph);
+};
+
+// Helper class to manage edges in OpGraph, mainly to reduce congitive complexity of the build function
+struct EdgeHelper {
+    BlockOpGraph &graph;
+    DenseSet<std::pair<Operation *, Operation *>> seen;
+    Block *block;
+
+    // find the ancestor directly in the block, and in opIndex; return nullptr if either fails
+    Operation *resolveToBlockOp(Operation *op);
+
+    template <bool IsMemory = false> void addEdge(Operation *pred, Operation *succ);
+
+    template <bool IsMemory = false> void addEdgeToUser(Operation *op, Operation *user)
+    {
+        if (graph.opIndex.contains(user)) {
+            return; // same-level use, already covered by the def-side loop
+        }
+        Operation *ancestor = resolveToBlockOp(user);
+        addEdge<IsMemory>(op, ancestor);
+    };
+
+    EdgeHelper(BlockOpGraph &g, Block *block) : graph(g), block(block) {};
 };
 
 } // namespace
 
-BlockOpGraph::BlockOpGraph(Block *block, const MemoryDependenceGraph &memGraph)
+Operation *EdgeHelper::resolveToBlockOp(Operation *op)
 {
-    llvm_unreachable("To be implemented by following commit");
+    if (graph.opIndex.contains(op)) {
+        return op;
+    }
+    Operation *ancestor = getAncestorInBlock(op, block);
+    if (!ancestor || !graph.opIndex.contains(ancestor)) {
+        return nullptr;
+    }
+    return ancestor;
+}
+
+template <bool IsMemory> void EdgeHelper::addEdge(Operation *pred, Operation *succ)
+{
+    if (!pred || !succ || pred == succ) {
+        return;
+    }
+    if (seen.insert({pred, succ}).second) {
+        LOG_DEBUG("Adding " << (IsMemory ? "memory " : "") << "edge from " << *pred << " to " << *succ << "\n");
+        graph.succs[pred].push_back(succ);
+        graph.preds[succ].push_back(pred);
+    }
+};
+
+BlockOpGraph::BlockOpGraph(ArrayRef<Operation *> allOps, Block *block, const MemoryDependenceGraph &memGraph)
+    : ops(allOps)
+{
+    for (unsigned i = 0; i < allOps.size(); ++i) {
+        opIndex[allOps[i]] = i;
+        preds[allOps[i]]; // ensure every node has an entry
+        succs[allOps[i]];
+    }
+
+    EdgeHelper edges(*this, block);
+
+    for (Operation *op : allOps) {
+        LOG_DEBUG("Processing op: " << *op << "\n");
+        // Edges from operand defs (including defs nested inside other ops).
+        for (Value const operand : op->getOperands()) {
+            Operation *defOp = operand.getDefiningOp();
+            if (!defOp) {
+                continue;
+            }
+            Operation *def = edges.resolveToBlockOp(defOp);
+            edges.addEdge(def, op);
+        }
+
+        // Edges from uses that live inside nested regions of another block-level op.
+        for (Value const result : op->getResults()) {
+            for (Operation *user : result.getUsers()) {
+                edges.addEdgeToUser(op, user);
+            }
+        }
+
+        for (auto *memDef : memGraph.getExecBefore(op)) {
+            Operation *def = edges.resolveToBlockOp(memDef);
+            edges.addEdge<true>(def, op);
+        }
+
+        for (auto *memUser : memGraph.getExecAfter(op)) {
+            edges.addEdgeToUser<true>(op, memUser);
+        }
+    }
 }
 
 static llvm::FailureOr<DenseMap<Operation *, int>> collectBlockIds(ArrayRef<Operation *> allOps)
@@ -128,7 +213,7 @@ static llvm::LogicalResult reorderOpsInBlock(Block &block, const MemoryDependenc
 {
     auto allOps = llvm::to_vector(llvm::make_pointer_range(block.without_terminator()));
 
-    const BlockOpGraph graph {&block, memGraph};
+    const BlockOpGraph graph {allOps, &block, memGraph};
     llvm::FailureOr<DenseMap<Operation *, int>> opBlockIdOpt = collectBlockIds(allOps);
     if (failed(opBlockIdOpt)) {
         return failure();
