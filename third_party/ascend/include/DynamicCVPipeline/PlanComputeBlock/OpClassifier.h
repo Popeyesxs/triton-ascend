@@ -63,7 +63,7 @@ private:
     llvm::SmallVector<Operation *> cubeSeeds;
 
     std::shared_ptr<AliasAnalysis> aliasAnalysis;
-    std::shared_ptr<MemoryDependenceGraph> memDepGraph;
+    std::shared_ptr<CVPipeline::MemoryDependenceGraph> memDepGraph;
 
     // Mark an operation as CUBE
     void markCube(Operation *op);

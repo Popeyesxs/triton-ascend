@@ -36,10 +36,12 @@ inline constexpr std::string_view toStrCoreType(CoreType a)
 }
 inline constexpr CoreType fromStrCoreType(std::string_view s)
 {
-    if (s == "VECTOR")
+    if (s == "VECTOR") {
         return CoreType::VECTOR_ONLY;
-    if (s == "CUBE")
+    }
+    if (s == "CUBE") {
         return CoreType::CUBE_ONLY;
+    }
 
     return CoreType::UNDETERMINED;
 }

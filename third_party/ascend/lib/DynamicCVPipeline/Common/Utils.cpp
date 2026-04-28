@@ -4,7 +4,6 @@
 namespace mlir {
 namespace CVPipeline {
 
-// Core type functions implementation
 const char *literalCoreType(CoreType ct)
 {
     switch (ct) {
@@ -17,13 +16,14 @@ const char *literalCoreType(CoreType ct)
         case UNDETERMINED:
             return "UNDETERMINED";
     }
-    return "Unknown";
+    return "UNKNOWN";
 }
 
 CoreType lookupOpCoreType(Operation *op)
 {
-    if (!op)
+    if (!op) {
         return UNDETERMINED;
+    }
     if (auto a = op->getAttrOfType<StringAttr>(attr::kCoreType)) {
         return fromStrCoreType(a.getValue());
     }

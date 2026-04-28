@@ -26,6 +26,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 using namespace mlir;
 using namespace triton;
@@ -38,6 +39,7 @@ void PlanComputeBlockPass::runOnOperation()
 {
     ModuleOp module = getOperation();
     OpPassManager pm(module.getOperationName());
+    CVPipeline::ComputeBlockIdManager::getInstance().reset();
     LOG_DEBUG("Enter pass.");
 
     // Step 1: Run OpClassifierPass to classify operations

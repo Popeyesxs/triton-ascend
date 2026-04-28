@@ -26,7 +26,7 @@
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
-static constexpr const char *DEBUG_TYPE = "OpClassifier";
+static constexpr const char *DEBUG_TYPE = "op-classifier";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
 using namespace mlir::triton;
@@ -350,7 +350,7 @@ void OpClassifierPass::runOnOperation()
     ModuleOp module = getOperation();
 
     aliasAnalysis = std::make_shared<AliasAnalysis>(module);
-    memDepGraph = std::make_shared<MemoryDependenceGraph>(module, *aliasAnalysis);
+    memDepGraph = std::make_shared<CVPipeline::MemoryDependenceGraph>(module, *aliasAnalysis);
 
     // Initialize the pass
     // Collect all operations
