@@ -135,7 +135,6 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
     auto loadOp = rewriter.create<triton::LoadOp>(loc, newPtr, newMask, newOther,
                                    newBoundaryCheck, op.getPadding(),
                                    op.getCache(), op.getEvict(), op.getIsVolatile());
-    loadOp->setAttr(ImplicitPermuteHandledTAG, UnitAttr::get(rewriter.getContext()));
 
     auto permuteResult = tf.materializeImplicitPermute(
         loadOp.getResult(), loc, rewriter);
@@ -191,7 +190,6 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
 
     auto storeOp = rewriter.create<triton::StoreOp>(loc, newPtr, permuteResult, newMask,
                newBoundaryCheck, op.getCache(), op.getEvict());
-    storeOp->setAttr(ImplicitPermuteHandledTAG, UnitAttr::get(rewriter.getContext()));
 
     rewriter.eraseOp(op);
     return success();
@@ -242,7 +240,6 @@ LogicalResult AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op,
         newMask,
         op.getSem(),
         op.getScope());
-    newAtomic->setAttr(ImplicitPermuteHandledTAG, UnitAttr::get(rewriter.getContext()));
 
     // The returned old value should be in OLD layout for users => permute back (load-side).
     MemOpTransformer tfLoad(MemOpTransformer::MemType::load);
@@ -294,7 +291,6 @@ LogicalResult AtomicCASConverter::matchAndRewrite(triton::AtomicCASOp op,
         newVal,
         op.getSem(),
         op.getScope());
-    newAtomic->setAttr(ImplicitPermuteHandledTAG, UnitAttr::get(rewriter.getContext()));
 
     MemOpTransformer tfLoad(MemOpTransformer::MemType::load);
     tfLoad.ptrState = tf.ptrState;
