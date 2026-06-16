@@ -16,6 +16,7 @@
 #include "ascend/include/TritonToLinalg/Passes.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
+#include "ascend/include/RemToMaskConversion/Passes.h"
 #include "ascend/include/TritonToUnstructure/Passes.h"
 #include "ascend/include/TritonToHIVM/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
@@ -353,6 +354,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     [](mlir::PassManager &pm, bool compileOn91095) {
     pm.addPass(mlir::triton::createTritonToHFusionPass(compileOn91095));
   });
+
+  m.def("add_rem_to_mask_conversion", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createRemToMaskConversionPass());});
 
   m.def("add_discrete_mask_access_conversion", [](mlir::PassManager &pm,
     bool compileOn91095, bool forceSimtTemplate, bool enableSyncBlockLock) {

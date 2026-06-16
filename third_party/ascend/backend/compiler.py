@@ -191,6 +191,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             passes.common.add_canonicalizer(pm)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
+        ascend.passes.ttir.add_rem_to_mask_conversion(pm)
         ascend.passes.ttir.add_triton_to_structure(
             pm,
             enable_mask_fallback_conversion,

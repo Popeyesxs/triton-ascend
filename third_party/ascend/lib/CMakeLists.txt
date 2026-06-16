@@ -7,6 +7,7 @@ add_subdirectory(TritonToLinalg)
 add_subdirectory(Utils)
 add_subdirectory(TritonControlFlowOpt)
 add_subdirectory(DiscreteMaskAccessConversion)
+add_subdirectory(RemToMaskConversion)
 add_subdirectory(TritonToUnstructure)
 add_subdirectory(TritonToLLVM)
 add_subdirectory(TritonToStructured)
@@ -17,6 +18,7 @@ add_subdirectory(TritonAffinityOpt)
 if(TRITON_ENABLE_COVERAGE_HITEST)
   set(_instrument_targets
       DiscreteMaskAccessConversion
+      RemToMaskConversion
       TritonToAnnotation
       TritonToHFusion
       TritonToHIVM

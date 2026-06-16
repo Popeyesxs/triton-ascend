@@ -6,6 +6,7 @@
 #include "ascend/include/TritonToLinalg/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
+#include "ascend/include/RemToMaskConversion/Passes.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferOuterScope.h"
@@ -79,6 +80,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerTritonToLinalgPasses();
   mlir::triton::registerTritonControlFlowOptPasses();
   mlir::triton::registerDiscreteMaskAccessConversion();
+  mlir::triton::registerRemToMaskConversion();
   mlir::triton::registerTritonToStructuredPasses();
   mlir::triton::registerTritonToAnnotationPasses();
   mlir::triton::registerTritonToUnstructurePasses();
