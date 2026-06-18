@@ -18,32 +18,37 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-from triton.language import math
 
-from . import libdevice
-from . import extension
+import pytest
+import triton
+import triton.language as tl
+import time
+import torch
+import torch_npu
+import test_common
 
-extension.parallel = extension.aux_ops.parallel
-libdevice.isfinited = extension.math_ops.isfinited
-libdevice.finitef = extension.math_ops.finitef
-libdevice.flip = extension.flip
 
-libdevice.umulhi = math.umulhi
-libdevice.exp = math.exp
-libdevice.exp2 = math.exp2
-libdevice.log = math.log
-libdevice.log2 = math.log2
-libdevice.cos = math.cos
-libdevice.sin = math.sin
-libdevice.sqrt = math.sqrt
-libdevice.sqrt_rn = math.sqrt_rn
-libdevice.rsqrt = math.rsqrt
-libdevice.div_rn = math.div_rn
-libdevice.erf = math.erf
-libdevice.floor = math.floor
-libdevice.ceil = math.ceil
-libdevice.fdiv = math.fdiv
-libdevice.fma = math.fma
-libdevice.abs = math.abs
+@triton.jit
+def triton_neg_index_load_kernel(in_ptr, out_ptr, BLOCK_SIZE: tl.constexpr, NEG_INDEX: tl.constexpr):
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset >= NEG_INDEX
+    tmp = tl.load(in_ptr + ((-NEG_INDEX) + offset), mask, other=0.0)
+    tl.store(out_ptr + offset, tmp)
 
-__all__ = ["libdevice", "extension"]
+
+def triton_neg_index_load(in_tensor, index):
+    out_tensor = torch.zeros(in_tensor.shape, device=in_tensor.device, dtype=in_tensor.dtype)
+    triton_neg_index_load_kernel[(1,)](in_tensor, out_tensor, in_tensor.numel(), index)
+    return out_tensor
+
+
+def torch_neg_index_load(in_tensor, index):
+    out = torch.zeros(in_tensor.shape, device=in_tensor.device, dtype=in_tensor.dtype)
+    out[index:] = in_tensor[:index]
+    return out
+
+
+def test_neg_index_load():
+    input_data = torch.arange(12, device="npu", dtype=torch.float32)
+    triton_out = triton_neg_index_load(input_data, 6)
+    torch_out = torch_neg_index_load(input_data, 6)

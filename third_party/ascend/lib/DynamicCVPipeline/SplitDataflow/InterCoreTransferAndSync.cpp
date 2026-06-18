@@ -127,13 +127,13 @@ std::pair<mlir::Operation *, mlir::Operation *> InterCoreTransferAndSyncPass::ge
     mlir::ModuleOp module)
 {
     mlir::Operation *knownOpInBlock = nullptr;
-    module.walk([&](mlir::Operation *op) {
-        if (knownOpInBlock) {
-            return;
-        }
+    module.walk<WalkOrder::PreOrder>([&](mlir::Operation *op) {
         if (CVPipeline::getOpBlockId(op).value_or(-1) == targetId) {
             knownOpInBlock = op;
+            return WalkResult::interrupt();
         }
+
+        return WalkResult::advance();
     });
 
     if (!knownOpInBlock) {
@@ -373,9 +373,9 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
         MLIRContext *ctx = extractSliceOp->getContext();
         extractSliceOp->setAttr(CVPipeline::kMatmulExtract, UnitAttr::get(ctx));
         originalResult.replaceUsesWithIf(extractSliceOp.getResult(),
-            [&](OpOperand &use) { return use.getOwner() != extractSliceOp.getOperation(); });   
-    
-    
+            [&](OpOperand &use) { return use.getOwner() != extractSliceOp.getOperation(); });
+
+
         LOG_DEBUG("cubeValueMapping[originalResult]" << originalResult << "\n");
         LOG_DEBUG("cubeValueMapping[originalResult]extractSliceOp.getResult()   " << extractSliceOp.getResult() << "\n");
         cubeValueMapping[originalResult] = extractSliceOp.getResult();
@@ -427,7 +427,7 @@ mlir::Value InterCoreTransferAndSyncPass::normalizeIfNeeded(OpBuilder &builder, 
     } else {
         builder.setInsertionPointAfter(origValue.getDefiningOp());
     }
-    
+
     auto floatElemTy = cast<FloatType>(elemType);
     auto zeroConstOp = builder.create<arith::ConstantFloatOp>(
         loc, APFloat::getZero(floatElemTy.getFloatSemantics()), floatElemTy);
@@ -492,7 +492,7 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder, Dependency
 
     if (iniDepMatmulOp) {
         LOG_DEBUG(*iniDepMatmulOp);
-        if (iniDepMatmulOp->hasAttr(CVPipeline::kMatmulADep) 
+        if (iniDepMatmulOp->hasAttr(CVPipeline::kMatmulADep)
             && iniDepMatmulOp->hasAttr(CVPipeline::kMatmulBDep)) {
             isOnlyDepInMatmul = false;
         }
@@ -527,7 +527,7 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder, Dependency
 
     auto [newProdStart, newProdEnd] = getBlockStartEnd(dep.producerBlockId, module);
     builder.setInsertionPointAfter(newProdEnd);
-    
+
     auto reshape3Dcst = builder.create<arith::ConstantOp>(loc, builder.getI64TensorAttr(shape3D));
     auto reshape3DOp = builder.create<tensor::ReshapeOp>(loc, type3D, newValue, reshape3Dcst);
 
@@ -639,13 +639,13 @@ mlir::Operation *InterCoreTransferAndSyncPass::analyzeConsumerReadInsertPoint(
         }
     }
     auto firstConsumerOp = std::min_element(
-        consumerOps.begin(), 
-        consumerOps.end(), 
+        consumerOps.begin(),
+        consumerOps.end(),
         [](mlir::Operation* a, mlir::Operation* b) {
             return a->isBeforeInBlock(b);
         }
     );
-    
+
     return firstConsumerOp != consumerOps.end() ? *firstConsumerOp : nullptr;
 }
 
@@ -1031,7 +1031,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(OpBuilder &builde
     auto [consStart, consEnd] = getBlockStartEnd(dep.consumerBlockId, module);
 
     Operation *consumedDataOp = nullptr;
-  
+
     if (dep.consumerBlockId == dep.iniConsumerBlockId) {
         auto consumerPoint = analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
         consStart = consumerPoint;
@@ -1148,7 +1148,7 @@ llvm::SmallVector<mlir::Operation *> InterCoreTransferAndSyncPass::insertAnalyze
     mlir::ModuleOp module, FlagIdReuseManager &flagIdReuseManager)
 {
     using OpVector = llvm::SmallVector<mlir::Operation *>;
-    
+
     // E1 (per-pipe FIFO) is isolated per MLIR block: ops on one (core, pipe)
     llvm::DenseMap<Block *, llvm::SmallDenseMap<hivm::TCoreType, llvm::SmallDenseMap<hivm::PIPE, OpVector>>>
         sequenceOpMap;
@@ -1279,6 +1279,54 @@ void InterCoreTransferAndSyncPass::remapInterCoreTransferFlagIds(
     });
 }
 
+void InterCoreTransferAndSyncPass::sortDependencies(llvm::SmallVector<DependencyInfo> &dependencies, mlir::ModuleOp module)
+{
+    if (dependencies.size() <= 1) {
+        return;
+    }
+
+    // Step 1: Walk the entire module and assign a monotonically increasing order
+    //         to each operation, representing its position in the IR.
+    llvm::DenseMap<mlir::Operation *, unsigned> opOrder;
+    unsigned order = 0;
+    module.walk([&](mlir::Operation *op) {
+        opOrder[op] = order++;
+    });
+
+    // Step 2: Helper lambda — get the earliest user op of dep.value within the
+    //         consumer compute block.
+    auto getFirstConsumerOp = [&](const DependencyInfo &dep) -> mlir::Operation * {
+        mlir::Operation *firstConsumer = nullptr;
+        unsigned firstOrder = std::numeric_limits<unsigned>::max();
+        for (auto *user : dep.value.getUsers()) {
+            auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+            if (userBlockIdOpt && static_cast<int>(*userBlockIdOpt) == dep.consumerBlockId) {
+                auto it = opOrder.find(user);
+                if (it != opOrder.end() && it->second < firstOrder) {
+                    firstOrder = it->second;
+                    firstConsumer = user;
+                }
+            }
+        }
+        return firstConsumer;
+    };
+
+    // Step 3: Sort
+    std::sort(dependencies.begin(), dependencies.end(), [&](const DependencyInfo &a, const DependencyInfo &b) {
+        // the dependency whose consumer op appears earlier comes first.
+        auto *aConsOp = getFirstConsumerOp(a);
+        auto *bConsOp = getFirstConsumerOp(b);
+        if (aConsOp && bConsOp) {
+            unsigned aConsOpOrder = opOrder.lookup(aConsOp);
+            unsigned bConsOpOrder = opOrder.lookup(bConsOp);
+            if (aConsOpOrder != bConsOpOrder) {
+                return aConsOpOrder < bConsOpOrder;
+            }
+        }
+        return false;
+    });
+}
+
 // Main Processing
 LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     FlagIdManager &flagManager, FlagIdReuseManager &flagIdReuseManager)
@@ -1293,6 +1341,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     }
 
     llvm::SmallVector<DependencyInfo> &V2CDependencies = info.getV2CDependencies();
+    sortDependencies(V2CDependencies, module);
     LOG_DEBUG("[DEBUG] V2CDependencies size: " << V2CDependencies.size() << "\n");
     for (size_t i = 0; i < V2CDependencies.size(); ++i) {
         auto &dep = V2CDependencies[i];
@@ -1320,6 +1369,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     LOG_DEBUG("Completed V->C transfers and syncs.\n");
 
     llvm::SmallVector<DependencyInfo> &C2VDependencies = info.getC2VDependencies();
+    sortDependencies(C2VDependencies, module);
     LOG_DEBUG("[DEBUG] C2VDependencies size: " << C2VDependencies.size() << "\n");
     // Step 2: Handle C->V dependencies
     for (auto &dep : C2VDependencies) {
