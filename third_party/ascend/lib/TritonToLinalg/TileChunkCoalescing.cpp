@@ -132,8 +132,8 @@ static std::optional<TileSeed> findSeed(ModuleOp moduleOp) {
       auto mul = dyn_cast<arith::MulIOp>(u);
       if (!mul)
         continue;
-      Value other = (mul.getLhs() == pid.getResult()) ? mul.getRhs()
-                                                       : mul.getLhs();
+      Value other =
+          (mul.getLhs() == pid.getResult()) ? mul.getRhs() : mul.getLhs();
       int64_t T = 0;
       if (!getConstInt(other, T) || T <= 1)
         continue;
@@ -323,7 +323,7 @@ static void rewriteModule(ModuleOp moduleOp, IRRewriter &rw) {
   if (footprintUnit > 0)
     maxH = std::min<int64_t>(maxH, kUBBytesBudget / footprintUnit);
   if (maxH < 2)
-    return;  // even H=2 would overflow UB
+    return; // even H=2 would overflow UB
 
   int64_t numTiles = (seed->bound + seed->tileLen - 1) / seed->tileLen;
   int64_t H = chooseH(numTiles, seed->tileLen, elemBytes, maxH);
@@ -404,7 +404,8 @@ static void rewriteModule(ModuleOp moduleOp, IRRewriter &rw) {
     if (!isa<RankedTensorType>(v.getType()))
       return v;
     Value e = rw.create<triton::ExpandDimsOp>(v.getLoc(), v, 0);
-    Value b = rw.create<triton::BroadcastOp>(v.getLoc(), liftTy(v.getType()), e);
+    Value b =
+        rw.create<triton::BroadcastOp>(v.getLoc(), liftTy(v.getType()), e);
     vmap[v] = b;
     return b;
   };
@@ -505,8 +506,8 @@ static void rewriteModule(ModuleOp moduleOp, IRRewriter &rw) {
       continue;
     }
 
-    SmallVector<Value> operands =
-        llvm::map_to_vector(op->getOperands(), [&](Value o) { return liftOpd(o); });
+    SmallVector<Value> operands = llvm::map_to_vector(
+        op->getOperands(), [&](Value o) { return liftOpd(o); });
     SmallVector<Type> resTypes = llvm::map_to_vector(
         op->getResultTypes(), [&](Type t) -> Type { return liftTy(t); });
     Operation *nu = rw.create(loc, op->getName().getIdentifier(), operands,
@@ -523,11 +524,11 @@ static void rewriteModule(ModuleOp moduleOp, IRRewriter &rw) {
   moduleOp->setAttr(kCoalesceAxisAttr, IntegerAttr::get(i32Ty, seed->axis));
 }
 
-}  // namespace
+} // namespace
 
 void rewriteTileChunkCoalesce(ModuleOp moduleOp) {
   IRRewriter rw(moduleOp.getContext());
   rewriteModule(moduleOp, rw);
 }
 
-}  // namespace TileChunkCoalescing
+} // namespace TileChunkCoalescing
