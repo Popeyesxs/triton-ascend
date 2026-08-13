@@ -14,6 +14,7 @@
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
+#include "ascend/include/TritonToGraph/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
 #include "ascend/include/TritonToHIVM/Passes.h"
 #include "ascend/include/TritonToLLVM/Passes.h"
@@ -82,6 +83,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
               globalKernel, namedOps, enableNd2nzOnVector, enableSelectAnalysis,
               compileOn91095));
         });
+
+  m.def("add_merge_concat_load_buffer", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cfg::createMergeConcatLoadBufferPass());
+  });
 
   m.def("add_triton_to_unstructure",
         [](mlir::PassManager &pm, bool compileOn91095, bool forceSimtTemplate) {
