@@ -28,11 +28,13 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Casting.h"
 #include <cstdint>
 #include <optional>
 #include <string_view>
 
 #include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 
 namespace mlir {
 namespace CVPipeline {
@@ -67,8 +69,6 @@ inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kForMayNotExec =
     "ssbuffer.for_may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
-inline constexpr llvm::StringLiteral kEnableUbRefineOpt =
-    "ssbuffer.enable_ub_refine_opt";
 inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
 inline constexpr llvm::StringLiteral kArg = "ssbuffer.arg";
@@ -83,6 +83,7 @@ inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
     "hivm.tightly_coupled_buffer";
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
+inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
@@ -166,8 +167,14 @@ inline bool isMainLoopOp(Operation *op) {
   return op && isa<scf::ForOp, scf::WhileOp>(op) && op->hasAttr(kMainLoop);
 }
 
-inline bool isCubeOp(Operation *op) {
-  return !isScfOp(op) && CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;
+CoreType getCoreTypeOfSimpleOpOrCf(Operation *op);
+
+inline bool isCubeSimpleOpOrCf(Operation *op) {
+  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::CUBE_ONLY;
+}
+
+inline bool isVectorSimpleOpOrCf(Operation *op) {
+  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::VECTOR_ONLY;
 }
 
 // ============================================================================
@@ -253,6 +260,65 @@ bool allResultHasOneUser(Operation *op);
 int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
 
 int getLoopCarriedArgIndex(Value operand, Block *block);
+
+// Helper: convert OpCoreType to string for IR attribute
+inline llvm::StringRef coreTypeToString(CoreType ct) {
+  switch (ct) {
+  case CUBE_ONLY:
+    return "CUBE";
+  case VECTOR_ONLY:
+    return "VECTOR";
+  case CUBE_AND_VECTOR:
+    return "CUBE_AND_VECTOR";
+  default:
+    return "UNDETERMINED";
+  }
+}
+
+inline OpOperand *getTiedYieldOperand(Value value, Block *block) {
+  int argIdx = getLoopCarriedArgIndex(value, block);
+  if (argIdx == -1) {
+    return nullptr;
+  }
+  auto *terminator = block->getTerminator();
+  return &terminator->getOpOperand(argIdx);
+}
+
+inline Operation *getLoopCarriedDefOp(Value value, Block *block) {
+  auto *yieldOperand = getTiedYieldOperand(value, block);
+  if (yieldOperand && yieldOperand->get()) {
+    return yieldOperand->get().getDefiningOp();
+  }
+  return nullptr;
+}
+
+inline bool isTensorComputeOp(Operation *op) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalg::isaCopyOpInterface(linalgOp))
+      return false;
+    auto genericOp = dyn_cast<linalg::GenericOp>(op);
+    if (genericOp && linalg::isaBroadcastOpInterface(genericOp).has_value())
+      return false;
+    if (isa<linalg::FillOp>(op))
+      return false;
+    return true;
+  }
+
+  if (op->hasTrait<mlir::OpTrait::Elementwise>()) {
+    return llvm::any_of(op->getResultTypes(),
+                        [](Type t) { return isa<RankedTensorType>(t); });
+  }
+
+  return false;
+}
+
+// Determine FixpipePreQuantMode from a trunc op.
+// Returns std::nullopt for scalars (non-shaped types) or unrecognized patterns.
+// Supported patterns:
+// - arith.truncf: f32 -> bf16, f32 -> f16
+// - arith.trunci: i32 -> i8
+std::optional<hivm::FixpipePreQuantMode>
+getFixpipePreQuantMode(Operation *truncOp);
 
 } // namespace CVPipeline
 } // namespace mlir

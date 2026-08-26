@@ -20,31 +20,45 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
-#define TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
+#include "DynamicCVPipeline/Common/CycleDetector.h"
+#include "mlir/IR/Operation.h"
 
-#include <memory>
+namespace mlir::CVPipeline {
 
-#include "mlir/IR/BuiltinOps.h"
+bool DependencyCycleDetector::detectCycleFrom(Operation *cur) {
+  if (group.contains(cur)) {
+    return true;
+  }
+  if (!visited.insert(cur).second) {
+    return false;
+  }
 
-#include "mlir/Pass/Pass.h"
+  bool createsCycle = false;
 
-namespace mlir {
-namespace triton {
+  depHelper.forEachUserInSameBlock(cur, [&](Operation *user) {
+    if (createsCycle)
+      return;
+    createsCycle =
+        llvm::any_of(bm.getOpsInSameBlock(user),
+                     [this](Operation *user) { return detectCycleFrom(user); });
+    return;
+  });
 
-class PlanCubeBlockPass
-    : public PassWrapper<PlanCubeBlockPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PlanCubeBlockPass);
+  return createsCycle;
+}
 
-  PlanCubeBlockPass() = default;
-  void runOnOperation() override;
+bool DependencyCycleDetector::detectCycle() {
+  llvm::DenseSet<Operation *> externalUsers;
+  for (auto *op : group) {
+    depHelper.forEachUserInSameBlock(op, [&](Operation *user) {
+      if (!group.contains(user)) {
+        externalUsers.insert(user);
+      }
+    });
+  }
+  return llvm::any_of(externalUsers, [this](Operation *op) {
+    return this->detectCycleFrom(op);
+  });
+}
 
-  llvm::StringRef getArgument() const final { return "plan-cube-block"; }
-};
-
-std::unique_ptr<OperationPass<ModuleOp>> createPlanCubeBlockPass();
-} // namespace triton
-} // namespace mlir
-
-#endif // TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
+} // namespace mlir::CVPipeline

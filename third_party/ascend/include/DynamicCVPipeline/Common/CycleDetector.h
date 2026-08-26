@@ -20,31 +20,33 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
-#define TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
+#ifndef TRITON_DYNAMIC_CV_PIPELINE_COMMON_CYCLEDETECTOR_H
+#define TRITON_DYNAMIC_CV_PIPELINE_COMMON_CYCLEDETECTOR_H
 
-#include <memory>
+#include "DynamicCVPipeline/Common/DependencyHelper.h"
+#include "DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/Support/LLVM.h"
+namespace mlir::CVPipeline {
 
-#include "mlir/IR/BuiltinOps.h"
+class DependencyCycleDetector {
+  const DenseSet<Operation *> &group;
+  llvm::DenseSet<mlir::Operation *> visited;
+  const DependencyHelper depHelper;
+  ComputeBlockIdManager &bm;
+  Block *const block;
 
-#include "mlir/Pass/Pass.h"
+  bool detectCycleFrom(Operation *cur);
 
-namespace mlir {
-namespace triton {
-
-class PlanCubeBlockPass
-    : public PassWrapper<PlanCubeBlockPass, OperationPass<ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PlanCubeBlockPass);
+  DependencyCycleDetector(Block *block, const DependencyHelper &depHelper,
+                          llvm::DenseSet<mlir::Operation *> &group,
+                          ComputeBlockIdManager &bm)
+      : block(block), depHelper(depHelper), group(group), bm(bm) {}
 
-  PlanCubeBlockPass() = default;
-  void runOnOperation() override;
-
-  llvm::StringRef getArgument() const final { return "plan-cube-block"; }
+  bool detectCycle();
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createPlanCubeBlockPass();
-} // namespace triton
-} // namespace mlir
+} // namespace mlir::CVPipeline
 
-#endif // TRITION_ADAPTER_DYNAMIC_CV_PIPELINE_PLAN_COMPUTE_BLOCK_PLAN_CUBE_BLOCK_PASS_H
+#endif
