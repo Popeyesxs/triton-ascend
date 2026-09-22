@@ -21,7 +21,7 @@ from .custom_op import custom_semantic
 
 
 @builtin
-def sparse_gather_load_to_l1cache(base, index, dst, block_r, valid_region_count, region_size, dim_size, stride_token,
+def sparse_gather_load_to_l1cache(dst, base, index, block_r, valid_region_count, region_size, dim_size, stride_token,
                                   region_valid_shift, region_id_mask, l2_cache_mode=0, _semantic=None):
     """
     Gather index-selected regions of a paged cache from GM straight into L1.
@@ -39,15 +39,17 @@ def sparse_gather_load_to_l1cache(base, index, dst, block_r, valid_region_count,
     or a negative sentinel for a padding slot. Padding slots and the unused tail
     of a partial region are zero filled, so every row of ``dst`` is written.
 
+    :param dst: Destination buffer, which must be allocated in L1 with shape
+        ``[block_r * region_size, dim_size]``. Named first to match the
+        template, whose parameter list the lowering reorders so the tile being
+        filled comes ahead of what goes into it.
+    :type dst: bl.buffer
     :param base: Base of the gathered tensor (in GM). Fold any head/group offset
         into the pointer; token rows are ``stride_token`` elements apart and
         ``dim_size`` elements long.
     :type base: tensor (pointer type)
     :param index: Base of this row's packed region metadata (in GM).
     :type index: tensor (pointer type)
-    :param dst: Destination buffer, which must be allocated in L1 with shape
-        ``[block_r * region_size, dim_size]``.
-    :type dst: bl.buffer
     :param block_r: Slots in the destination tile.
     :type block_r: int
     :param valid_region_count: Only the first ``min(block_r, valid_region_count)``

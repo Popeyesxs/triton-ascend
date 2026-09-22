@@ -70,9 +70,9 @@ def sparse_gather_kernel(
         # The group offset folds into the base pointer, and the row offset into
         # the metadata pointer, so the builtin only ever sees a token stride.
         al.sparse_gather_load_to_l1cache(
+            keys_l1,
             k_ptr + group * stride_k_group,
             packed_ptr + row * stride_packed_row + base,
-            keys_l1,
             block_r=BLOCK_R,
             valid_region_count=count - base,
             region_size=region_size,
@@ -82,9 +82,9 @@ def sparse_gather_kernel(
             region_id_mask=REGION_ID_MASK,
         )
         al.sparse_gather_load_to_l1cache(
+            values_l1,
             v_ptr + group * stride_v_group,
             packed_ptr + row * stride_packed_row + base,
-            values_l1,
             block_r=BLOCK_R,
             valid_region_count=count - base,
             region_size=region_size,
