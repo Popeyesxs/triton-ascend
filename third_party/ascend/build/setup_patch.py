@@ -117,9 +117,10 @@ def _get_ascend_llvm_package_info(base_dir):
     return {"name": name, "sym_name": sym_name, "url": url}
 
 
-def _apply_patch(patch_path):
+def _apply_patch(patch_path, *, exclude=()):
     try:
-        subprocess.run(["git", "apply", patch_path], check=True, stdout=subprocess.DEVNULL, cwd=str(_REPO_ROOT))
+        command = ["git", "apply", *[f"--exclude={path}" for path in exclude], patch_path]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, cwd=str(_REPO_ROOT))
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"patch({patch_path}) failed,cmd={e.cmd}, retcode={e.returncode}") from e
     except FileNotFoundError:
@@ -160,7 +161,6 @@ def get_triton_ascend_patch_file():
         "python/triton/runtime/autotuner.py",
         "python/triton/runtime/interpreter.py",
         "python/triton/runtime/autotuner.py",
-        "python/triton/runtime/jit.py",
         "bin/RegisterTritonDialects.h",
         "bin/triton-opt.cpp",
         "bin/CMakeLists.txt",
@@ -179,7 +179,9 @@ def _apply_triton_ascend_patch():
         _apply_patch(str(dev_patch))
     if os.path.isfile(patch):
         checkout_file(patch_files)
-        _apply_patch(str(patch))
+        # JIT integration is maintained directly in source, including the
+        # block-batching launch-grid hook. Do not reapply its legacy patch.
+        _apply_patch(str(patch), exclude=("python/triton/runtime/jit.py",))
 
 
 def _print_patch_restore_warning():

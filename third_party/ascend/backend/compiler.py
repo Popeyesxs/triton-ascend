@@ -72,6 +72,8 @@ from triton.backends.ascend.utils import (
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
 from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
+from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
+from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching_report import VALIDATION_POLICY, validate_compilation_result
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -368,10 +370,21 @@ def make_ttir(mod, metadata, opt):
         rewrite = getattr(ascend.passes.ttir, "rewrite_block_batching", None)
         if rewrite is None:
             raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
+        if opt.block_batching_grid is not None and opt.block_batching_axis < 0:
+            # Auto axis selection skips a grid axis the launch cannot divide.
+            # Absent the hint it keeps choosing the first axis the kernel reads
+            # a program id from, which may be a degenerate tiling axis.
+            _builder = ascend.ir.ascendnpu_ir_builder(mod.context, opt.target_arch)
+            _extents = ", ".join(f"{extent} : i32" for extent in opt.block_batching_grid)
+            mod.set_attr("hacc.block_batching_grid", _builder.parse_attr(f"[{_extents}]"))
         batch_source = str(mod)
         report = dict(
             rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout,
                     opt.block_batching_cv, opt.block_batching_cv and opt.enable_hivm_batch_matmul))
+        # Selection is done; hivmc rejects hacc.* module attrs it does not know.
+        _remove_attr = getattr(ascend.ir, "remove_attr", None)
+        if _remove_attr is not None:
+            _remove_attr(mod, "hacc.block_batching_grid")
         if report.get("implementation_version") != opt.block_batching_implementation:
             raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
         if report.get("lane_width") != opt.block_batching_factor and report["compile_status"] == "REWRITTEN":
@@ -392,6 +405,9 @@ def make_ttir(mod, metadata, opt):
         from .block_batching_guard_v3 import bind_plan
         bind_plan(report["guard"], batch_source)
         report["owner"] = "block_batching"
+        refusal = batching_vv_layout_refusal(report)
+        if refusal:
+            raise BatchingRejected(refusal)
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
         metadata["block_batching"] = report
@@ -521,11 +537,18 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             print(f"[DEBUG] cmd list: {shlex.join(cmd)}")
 
         pm.run(mod, 'ttir_to_linalg')
+        if "block_batching" in metadata and metadata["block_batching"].get("cv_mode") == "disabled":
+            metadata["block_batching"]["lane_scans_lowered"] = ascend.passes.ttir.lower_block_batching_scans(
+                mod, opt.block_batching_factor)
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_program_grid_metadata(mod, metadata)
         if "block_batching" in metadata:
+            metadata["block_batching"]["memory_lowering"] = {
+                "dynamic_contiguous_copy": ascend.passes.ttir.block_batching_has_dynamic_contiguous_copy(mod),
+                "libcall_inlining": False,
+            }
             # Ownership has served every TA mapping/lowering gate. Preserve it
             # in the immutable manifest, not as an unknown HACC LLVM attribute.
             if not ascend.passes.ttir.clear_block_batching_owner(mod):
@@ -941,6 +964,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 "--enable-triton-kernel-compile=true",
             ]
             _compile_option_list += _full_row_copy_compile_options(metadata, npu_compiler_path)
+            if "block_batching" in metadata:
+                for option in batching_memory_compile_options(metadata, npu_compiler_path,
+                                                               _supports_full_row_copy_inlining):
+                    if option not in _compile_option_list:
+                        _compile_option_list.append(option)
             # Temporary until the NPU compiler enables batch matmul by default in Q4.
             if metadata.get("enable_hivm_batch_matmul"):
                 _compile_option_list += ["--enable-hivm-batch-matmul"]
@@ -1332,6 +1360,10 @@ class NPUOptions:
     block_batching_factor: int = 1
     block_batching_cv: bool = False
     block_batching_axis: int = -1
+    # Original launch extents, including resolved callable grids for auto VV
+    # selection. This compile option distinguishes cached axis choices when
+    # runtime grid dimensions change. VV permits partial final groups.
+    block_batching_grid: Tuple[int] = None
     block_batching_layout: str = "auto"
     block_batching_implementation: int = field(default=IMPLEMENTATION_VERSION, init=False)
     block_batching_backend_revision: str = field(default="", init=False)
@@ -1457,6 +1489,11 @@ class NPUOptions:
 
     def __post_init__(self, arch, rule_mask):
         BatchRequest(self.block_batching_factor, self.block_batching_axis, self.block_batching_cv)
+        if self.block_batching_grid is not None:
+            grid = tuple(self.block_batching_grid)
+            if len(grid) != 3 or any(type(x) is not int or x < 1 for x in grid):
+                raise ValueError("block_batching_grid must be three positive integers")
+            object.__setattr__(self, "block_batching_grid", grid)
         if self.block_batching_layout not in ("auto", "semantic_only"):
             raise ValueError("block_batching_layout must be auto or semantic_only")
         if self.block_batching_factor == 1 or self.block_batching_cv:
@@ -1751,6 +1788,31 @@ class AscendBackend(BaseBackend):
         buffer_ir.load_dialects(ctx)
         ascend_ir.load_dialects(ctx)
         ascend.load_dialects(ctx)
+
+    @staticmethod
+    def annotate_launch_grid(kwargs, grid, *, bind=None):
+        """Attach launch extents before cache selection; return the launch grid.
+
+        Auto VV axis selection needs callable extents as well as static ones.
+        The JIT supplies lazy argument binding only for actual launches, keeping
+        warmup callbacks unevaluated. Returning the resolved value also keeps
+        reuse and launch from invoking the callback a second time.
+        """
+        factor = kwargs.get("block_batching_factor", 1)
+        if factor == 1 or "block_batching_grid" in kwargs:
+            return grid
+        if callable(grid):
+            if (bind is None or type(factor) is not int or factor <= 1
+                    or kwargs.get("block_batching_axis", -1) != -1
+                    or kwargs.get("block_batching_cv", False)):
+                return grid
+            grid = grid(bind())
+        if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
+            return grid
+        extents = [*grid, *((1, ) * (3 - len(grid)))]
+        if all(type(extent) is int and extent > 0 for extent in extents):
+            kwargs["block_batching_grid"] = tuple(extents)
+        return grid
 
     def make_compilation_writer(self, src, options, cache, override_enabled):
         if not hasattr(src, "block_batching_source_hash"):

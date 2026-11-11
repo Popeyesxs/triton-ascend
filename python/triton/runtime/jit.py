@@ -398,33 +398,49 @@ def create_function_from_signature(sig, kparams, backend):
     assert len(sig.parameters) == len(kparams)
     # Create the function argument list and the dict entries for the return statement
     specialization = []
+    uses_alignment_specialization = False
+    alignment_specialization_name = "__triton_alignment_specialization"
+    integer_annotation_types = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
     # signature
     for name, kp in zip(sig.parameters.keys(), kparams):
         if kp.is_constexpr:
             specialization.append(f'("constexpr", {name})')
         else:
-            is_const = 'True' if kp.is_const else 'False'
-            specialize = 'False' if kp.do_not_specialize else 'True'
-            align = 'False' if kp.do_not_specialize_on_alignment else 'True'
-            ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
+            is_const = kp.is_const
+            specialize = not kp.do_not_specialize
+            align = not kp.do_not_specialize_on_alignment
+            effective_align = alignment_specialization_name if align and specialize else "False"
+            ret = (f"specialize_impl(backend, {name}, {is_const}, {specialize}, "
+                   f"{effective_align})")
             if kp.annotation_type:
                 if isinstance(kp.annotation_type, str):
                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
                         # we do not specialize non-constexpr floats and bools:
                         specialize = False
                 if specialize:
-                    specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
+                    uses_alignment_specialization = uses_alignment_specialization or align
+                    if kp.annotation_type in integer_annotation_types:
+                        # An integer annotation constrains the type of runtime values, but must not discard a
+                        # constexpr classification already produced by the value specializer (for example, 1).
+                        specialization.append(f'(lambda ret: ret if ret[0] == "constexpr" '
+                                              f'else ("{kp.annotation_type}",) + ret[1:])({ret})')
+                    else:
+                        specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
                 else:
                     # skip runtime specialization:
                     specialization.append(f'("{kp.annotation_type}", None)')
             else:
+                uses_alignment_specialization = uses_alignment_specialization or (align and specialize)
                 specialization.append(f"{ret}")
 
     # compute argument string for a given parameter
     arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
+    alignment_specialization_init = (f"    {alignment_specialization_name} = "
+                                     "backend.use_alignment_specialization(options)\n"
+                                     if uses_alignment_specialization else "")
     func_body = f"""
 def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
-    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
+{alignment_specialization_init}    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
     specialization = [{','.join(specialization)}]
     return params, specialization, options
 """
@@ -704,20 +720,46 @@ class JITFunction(JITCallable, KernelInterface[T]):
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        _, _, _, backend, binder = self.device_caches[device]
+        annotate_grid = getattr(backend, "annotate_launch_grid", None)
+        if annotate_grid is not None:
+            # Resolve only when the backend needs launch extents for compilation.
+            # Pass the resolved grid through reuse and launch, so a callback with
+            # side effects is never evaluated twice in the same invocation.
+            bind_grid_args = None if warmup else lambda: binder(*args, **kwargs)[0]
+            grid = annotate_grid(kwargs, grid, bind=bind_grid_args)
+        get_handler = getattr(backend, "get_jit_reuse_handler", None)
+        handler = get_handler() if get_handler is not None else None
+        if handler is not None:
+            return handler.run(self, args, kwargs, grid, warmup, device, stream, backend, self._run_jit_tail)
+        return self._run_jit_tail(args, kwargs, grid, warmup, device, stream)
+
+    def _run_jit_tail(self, args, kwargs, grid, warmup, device, stream, *, owner=None, prepared=None,
+                      bound=None, specialization=None, raw_options=None, memory_key=None,
+                      on_initialized=None, initialize=None, frame=None):
+        # Optional backend continuation; all compilation and launch remain on this path.
+        owner = self if owner is None else owner
+        kernel_cache, kernel_key_cache, target, backend, binder = owner.device_caches[device]
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
-        bound_args, specialization, options = binder(*args, **kwargs)
+        if bound is None:
+            bound_args, specialization, options = binder(*args, **kwargs)
+        else:
+            bound_args, options = bound, raw_options
 
-        key = compute_cache_key(kernel_key_cache, specialization, options)
-        kernel = kernel_cache.get(key, None)
+        key = memory_key
+        kernel = prepared
+        if kernel is None:
+            if key is None:
+                key = compute_cache_key(kernel_key_cache, specialization, options)
+            kernel = kernel_cache.get(key, None)
 
         # Kernel is not cached; we have to compile.
         if kernel is None:
-            options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
+            options, signature, constexprs, attrs = owner._pack_args(backend, kwargs, bound_args, specialization,
                                                                     options)
 
-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+            kernel = owner._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
 
@@ -731,7 +773,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
         if not warmup:
             # canonicalize grid
             assert grid is not None
-            if callable(grid):
+            if frame is not None:
+                grid = frame.resolve_grid(grid, bound_args)
+            elif callable(grid):
                 grid = grid(bound_args)
             grid_size = len(grid)
             grid_0 = grid[0]
@@ -739,6 +783,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             grid_2 = grid[2] if grid_size > 2 else 1
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            if initialize is not None:
+                kernel = initialize(kernel)
+            elif on_initialized is not None:
+                kernel._init_handles()
+            if on_initialized is not None:
+                on_initialized(kernel)
+            if frame is not None:
+                frame.before_launch()
             # launch kernel
             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
