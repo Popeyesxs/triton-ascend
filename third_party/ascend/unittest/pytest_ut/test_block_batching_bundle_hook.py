@@ -1,14 +1,20 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Exercise the packaged public compiler hook, including callbacks deferred by JIT."""
 import ast
-from pathlib import Path
+import hashlib
+import importlib
+import sys
 import shutil
 import subprocess
+from collections import namedtuple
 from contextvars import ContextVar
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+from block_batching_contract_host import PACKAGE, batching, bundle_environment  # noqa: F401
 
 pytestmark = pytest.mark.backend('native')
 
@@ -31,129 +37,121 @@ def packaged_entries(tmp_path_factory):
     entry = next(n for n in compiler.body if isinstance(n, ast.FunctionDef) and n.name == 'compile')
     jit_cls = next(n for n in jit.body if isinstance(n, ast.ClassDef) and n.name == 'JITFunction')
     do_compile = next(n for n in jit_cls.body if isinstance(n, ast.FunctionDef) and n.name == '_do_compile')
-    return (compile(ast.Module(body=[entry], type_ignores=[]), str(staging / files[0]),
-                    'exec'), compile(ast.Module(body=[do_compile], type_ignores=[]), str(staging / files[1]), 'exec'))
+    cache_path = root / 'python/triton/runtime/cache.py'
+    cache_key = next(n for n in ast.parse(cache_path.read_text()).body
+                     if isinstance(n, ast.FunctionDef) and n.name == 'get_cache_key')
+
+    def bind(node, path, namespace):
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
+        return namespace[node.name]
+
+    return (lambda scope: bind(entry, staging / files[0], scope),
+            lambda scope: bind(do_compile, staging / files[1], scope),
+            bind(cache_key, cache_path, {'triton_key': lambda: 'host-test-installation'}))
 
 
 @pytest.fixture
-def compiler(packaged_entries):
-    target = object()
-    backend = SimpleNamespace()
-    make_backend = Mock(return_value=backend)
-    single = Mock(side_effect=lambda src, target, options, env: (src, target, options, env))
-    getenv = Mock(return_value={'KEY': 'current'})
-    scope = dict(make_backend=make_backend, GPUTarget=object, _compile=single, get_cache_invalidating_env_vars=getenv,
-                 driver=SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: target)))
-    exec(packaged_entries[0], scope)
-    return SimpleNamespace(compile=scope['compile'], backend=backend, make_backend=make_backend, single=single,
-                           getenv=getenv, target=target)
+def boundary(packaged_entries, bundle_environment, monkeypatch):  # noqa: F811
+    public, jit, cache_key = packaged_entries
+    host = bundle_environment
+    host.knobs.compilation = SimpleNamespace(override=False)
+    host.knobs.cache = SimpleNamespace(manager_class=None, remote_manager_class=None)
+    cache = sys.modules['triton.runtime.cache']
+    monkeypatch.setattr(cache, 'get_cache_key', cache_key, raising=False)
+    worker = importlib.import_module(PACKAGE + '.block_batching_worker')
+    target = SimpleNamespace(arch='Ascend950')
+
+    class Options(SimpleNamespace):
+
+        def hash(self):
+            return str(sorted(vars(self).items()))
+
+    def parse_options(opts):
+        normalized = dict(is_pure_simt=False, compile_mode='simd', block_batching_backend_revision='test')
+        normalized.update(opts)
+        return Options(**normalized)
+
+    backend = SimpleNamespace(target=target, hash=lambda: 'ascend', parse_options=parse_options)
+    source = SimpleNamespace(fn=SimpleNamespace(arg_names=[]), signature={}, hash=lambda: 'source',
+                             parse_options=lambda: {})
+    backend.compile_bundle = lambda src, options, base: batching.compile_bundle(backend, src, options, base)
+    current = {'COMPILER_ENV': 'current'}
+    groups = {}
+    candidates = []
+
+    def single(src, selected_target, options, env):
+        assert selected_target is target
+        environment = current if env is None else env
+        normalized = backend.parse_options(dict(options))
+        key = cache_key(src, backend, normalized, environment)
+        fingerprint = hashlib.sha256(key.encode()).hexdigest()
+        if fingerprint not in groups:
+            fields = dict(hash=fingerprint, **vars(normalized), **environment)
+            groups[fingerprint] = namedtuple('Metadata', fields)(**fields)
+        return SimpleNamespace(hash=fingerprint, metadata=groups[fingerprint])
+
+    def observe_candidate(compiler, base, options, request, positions):
+        candidates.append((base.hash, dict(compiler.env_vars)))
+        return base
+
+    monkeypatch.setattr(worker.CandidateCompiler, 'compile', observe_candidate)
+    compile_fn = public(
+        dict(make_backend=lambda _: backend, GPUTarget=object, _compile=single,
+             driver=SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: target))))
+    return SimpleNamespace(compile=compile_fn, jit=jit, cache_key=cache_key, backend=backend, target=target, src=source,
+                           current=current, groups=groups, candidates=candidates, worker=worker)
 
 
-@pytest.mark.parametrize('explicit', [None, {}, {'KEY': 'submitted', 'CUSTOM': 'caller-only'}])
-def test_opt_in_hook_freezes_one_environment_for_candidate_and_baseline(compiler, explicit):
-    caller_env = None if explicit is None else dict(explicit)
-    expected = dict(compiler.getenv.return_value if caller_env is None else caller_env)
-    frozen = object()
-    baseline_options = {'block_batching_factor': 1}
-
-    def with_env(src, options, compile_baseline, *, env_vars):
-        # A hook may take time to freeze the source, or invoke a callback after
-        # it returns. Neither the process nor the user's map can alter this request.
-        (compiler.getenv.return_value if caller_env is None else caller_env)['KEY'] = 'later'
-        return env_vars, compile_baseline
-
-    with_env.accepts_env_vars = True
-    compiler.backend.compile_bundle = with_env
-    env, baseline = compiler.compile('original', options={'block_batching_factor': 4}, _env_vars=caller_env)
-    assert env == expected
-    assert baseline(baseline_options, frozen) == (frozen, compiler.target, baseline_options, expected)
-    assert baseline(baseline_options) == ('original', compiler.target, baseline_options, expected)
-    assert compiler.getenv.call_count == int(caller_env is None)
+@pytest.mark.parametrize('submitted', [{}, {'COMPILER_ENV': 'submitted', 'CUSTOM_ENV': 'caller-only'}])
+def test_cold_and_cached_baseline_prove_exact_environment(boundary, submitted):
+    b = boundary
+    standard = b.compile(b.src, options={'block_batching_factor': 1, 'block_batching_axis': -1}, _env_vars=submitted)
+    assert b.candidates == []
+    b.groups.clear()  # Exercise a cold callback first, then a metadata cache hit.
+    for _ in range(2):
+        b.current['COMPILER_ENV'] = 'after submission'
+        result = b.compile(b.src, options={'block_batching_factor': 4}, _env_vars=submitted)
+        assert b.candidates[-1] == (standard.hash, submitted)
+        assert result.metadata == standard.metadata
+    assert len(b.candidates) == 2 and len(b.groups) == 1
 
 
-@pytest.mark.parametrize('caller_env', [None, {}, {'OLD': 'value'}])
-def test_existing_three_argument_hook_preserves_callback_semantics(compiler, caller_env):
-
-    def legacy(src, options, compile_variant):
-        return compile_variant
-
-    compiler.backend.compile_bundle = legacy
-    opt = {'block_batching_factor': 2}
-    callback = compiler.compile('original', options=opt, _env_vars=caller_env)
-    if caller_env is not None:
-        caller_env['LATER'] = 'legacy caller'
-    assert callback(opt, 'frozen') == ('frozen', compiler.target, opt, caller_env)
-    assert callback(opt)[3] is caller_env
-    compiler.getenv.assert_not_called()
+def test_unprovable_environment_falls_back_without_compiling_candidate(boundary):
+    b = boundary
+    result = b.compile(b.src, options={'block_batching_factor': 4}, _env_vars={'mixedCase': 'unprovable'})
+    assert result.candidate is None and result.baseline.metadata.mixedCase == 'unprovable'
+    assert result.block_batching['reason'] == 'BASELINE_ENVIRONMENT_NOT_PROVEN'
+    assert b.candidates == []
 
 
-@pytest.mark.parametrize('marker', [None, 'yes'])
-def test_legacy_override_does_not_inherit_parent_method_opt_in(compiler, marker):
-
-    class OptIn:
-
-        def compile_bundle(self, src, options, baseline, *, env_vars):
-            pytest.fail('the inherited method must not override the selected backend method')
-
-        compile_bundle.accepts_env_vars = True
-
-    class Legacy(OptIn):
-
-        def compile_bundle(self, src, options, baseline):
-            return baseline
-
-    if marker is not None:
-        Legacy.compile_bundle.accepts_env_vars = marker
-    compiler.make_backend.return_value = Legacy()
-    caller_env = {'EXPLICIT': 'legacy'}
-    callback = compiler.compile('original', options={'block_batching_factor': 2}, _env_vars=caller_env)
-    assert callback({}) == ('original', compiler.target, {}, caller_env)
-    compiler.getenv.assert_not_called()
+def test_mismatched_baseline_identity_is_an_error(boundary):
+    b = boundary
+    opts = {'block_batching_factor': 1, 'block_batching_axis': -1}
+    baseline = b.compile(b.src, options=opts, _env_vars={})
+    baseline.metadata = baseline.metadata._replace(hash='different-artifact')
+    with pytest.raises(b.worker.BatchCompileError) as caught:
+        b.worker._baseline_environment(b.src, b.backend, opts, baseline)
+    assert (caught.value.kind, caught.value.stage) == ('InvalidArtifact', 'bind')
 
 
-@pytest.mark.parametrize('options,has_hooks', [
-    (None, True),
-    ({}, True),
-    ({'block_batching_factor': 1}, True),
-    ({'block_batching_factor': 4}, False),
-])
-def test_single_kernel_bypasses_bundle_hooks_and_forwards_environment(compiler, options, has_hooks):
-    if has_hooks:
-        compiler.backend.compile_bundle = Mock(side_effect=AssertionError)
-    caller_env = {}
-    src = object()
-    assert compiler.compile(src, options=options, _env_vars=caller_env) == (src, compiler.target, options, {})
-    assert compiler.single.call_args.args[3] is caller_env
-    compiler.getenv.assert_not_called()
-
-
-def test_async_jit_submits_and_compiles_with_the_same_environment(packaged_entries, compiler):
-    submission = Mock(return_value='pending')
-
-    def compile_bundle(src, opts, base, *, env_vars):
-        return base({'block_batching_factor': 1})
-
-    compile_bundle.accepts_env_vars = True
-    compiler.backend.compile_bundle = compile_bundle
+def test_deferred_jit_uses_submission_environment_for_baseline_and_candidate(boundary):
+    b = boundary
+    submitted = dict(b.current)
+    submit = Mock(return_value='pending')
     cache = {}
-    kernel = SimpleNamespace(device_caches={0: (cache, {}, compiler.target, compiler.backend, None)},
-                             _call_hook=lambda *args: False, ASTSource=lambda *args: 'ttir-source',
-                             compile=compiler.compile)
-    current = {'KEY': 'submitted'}
-    options = SimpleNamespace(block_batching_factor=4)
-    key = Mock(return_value='submission-key')
-    active = ContextVar('test_async_compile_mode', default=SimpleNamespace(submit=submission))
-    jit_scope = dict(knobs=SimpleNamespace(runtime=SimpleNamespace(jit_cache_hook=None, jit_post_compile_hook=None)),
-                     _async_compile=SimpleNamespace(active_mode=active),
-                     get_cache_invalidating_env_vars=lambda: dict(current), get_cache_key=key)
-    exec(packaged_entries[1], jit_scope)
-    assert jit_scope['_do_compile'](kernel, 'jit-key', {}, 0, {}, options, {}, False) == 'pending'
-    key.assert_called_once_with('ttir-source', compiler.backend, options, {'KEY': 'submitted'})
-    current['KEY'] = 'changed after submission'
-    submission_key, deferred, finalize = submission.call_args.args
-    assert submission_key == 'submission-key'
-    compiled = deferred()
-    assert compiled == ('ttir-source', compiler.target, {'block_batching_factor': 1}, {'KEY': 'submitted'})
-    finalize(compiled)
-    assert cache == {'jit-key': compiled}
-    compiler.getenv.assert_not_called()
+    kernel = SimpleNamespace(device_caches={0: (cache, {}, b.target, b.backend, None)}, _call_hook=lambda *args: False,
+                             ASTSource=lambda *args: b.src, compile=b.compile)
+    options = b.backend.parse_options({'block_batching_factor': 4})
+    active = ContextVar('async_compile_mode', default=SimpleNamespace(submit=submit))
+    run = b.jit(
+        dict(knobs=SimpleNamespace(runtime=SimpleNamespace(jit_cache_hook=None, jit_post_compile_hook=None)),
+             _async_compile=SimpleNamespace(active_mode=active),
+             get_cache_invalidating_env_vars=lambda: dict(b.current), get_cache_key=b.cache_key))
+    assert run(kernel, 'jit-key', {}, 0, {}, options, {}, False) == 'pending'
+    key, deferred, finalize = submit.call_args.args
+    assert key == b.cache_key(b.src, b.backend, options, submitted)
+    b.current.clear()
+    result = deferred()
+    finalize(result)
+    assert result.metadata.COMPILER_ENV == 'current'
+    assert b.candidates == [(result.hash, submitted)] and cache == {'jit-key': result}

@@ -532,9 +532,9 @@ def rejected_bundle(baseline, request, decline, positions=(), retry=None):
     return BatchKernel(baseline, None, request, report, positions)
 
 
-def compile_bundle(backend, src, options, compile_variant, *, env_vars=None):
+def compile_bundle(backend, src, options, compile_variant):
     from triton import knobs
-    from .block_batching_worker import BatchDecline, CandidateCompiler
+    from .block_batching_worker import BatchDecline, CandidateCompiler, _baseline_environment
     from .utils import backend_policy
     request = BatchRequest(options.get('block_batching_factor', 1), options.get('block_batching_axis', -1))
     if request.factor == 1:
@@ -565,7 +565,7 @@ def compile_bundle(backend, src, options, compile_variant, *, env_vars=None):
     positions = _runtime_positions(src)
     if isinstance(positions, BatchDecline):
         return rejected_bundle(baseline, request, positions.payload())
+    env_vars = _baseline_environment(frozen, backend, baseline_options, baseline)
     if env_vars is None:
-        from triton.compiler.compiler import get_cache_invalidating_env_vars
-        env_vars = get_cache_invalidating_env_vars()
+        return rejected_bundle(baseline, request, dict(reason='BASELINE_ENVIRONMENT_NOT_PROVEN'), positions)
     return CandidateCompiler(backend, frozen, env_vars).compile(baseline, options, request, positions)

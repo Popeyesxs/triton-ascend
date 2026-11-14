@@ -291,6 +291,19 @@ def _variant_key(source, backend, options, env_vars):
     return hashlib.sha256(get_cache_key(source, backend, options, env_vars).encode()).hexdigest()
 
 
+def _baseline_environment(source, backend, baseline_options, baseline):
+    """Recover the submitted compiler environment from a cold or cached F1 result."""
+    if baseline.metadata.hash != baseline.hash:
+        raise BatchCompileError('baseline metadata disagrees with its cache key', kind='InvalidArtifact', stage='bind')
+    # Triton flattens its uppercase cache environment into the kernel metadata.
+    # Prove that projection against F1's actual key before using it in a child.
+    env_vars = {key: value for key, value in baseline.metadata._asdict().items() if key.isupper()}
+    normalized = backend.parse_options(dict(baseline_options, **source.parse_options()))
+    if _variant_key(source, backend, normalized, env_vars) == baseline.hash:
+        return env_vars
+    return None
+
+
 def _artifact_manifest(group, directory, variant):
     files = {}
     for name, location in group.items():

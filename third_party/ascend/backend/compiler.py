@@ -1897,13 +1897,9 @@ class AscendBackend(BaseBackend):
         import uuid
         return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
 
-    def compile_bundle(self, src, options, compile_variant, *, env_vars=None):
+    def compile_bundle(self, src, options, compile_variant):
         from .block_batching import compile_bundle
-        return compile_bundle(self, src, options, compile_variant, env_vars=env_vars)
-
-    # Only this hook opts in. A subclass overriding the legacy three-argument
-    # method keeps that convention unless its own method requests the snapshot.
-    compile_bundle.accepts_env_vars = True
+        return compile_bundle(self, src, options, compile_variant)
 
     def add_stages(self, stages, options, language):
         if self.target.backend == "npu":
