@@ -881,7 +881,10 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   });
 
   if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
-    if (ptrOffsetInfo.isScalarLike() &&
+    // A select after an unconditional scalar load cannot protect an invalid
+    // pointer when every mask lane is false. Keep masked loads on the guarded
+    // scalar-loop path below.
+    if (!op.getMask() && ptrOffsetInfo.isScalarLike() &&
         succeeded(splatAndLoadScenario(op, ptrOffsetInfo, rewriter))) {
       return success();
     }
@@ -979,7 +982,13 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     if (isLoadLike && op.getMask() && op.getOther() && mstate &&
         mstate->isMask() && mstate->dims.size() == resultShape.size() &&
         mstate->offsets.size() == resultShape.size() &&
-        !ptrOffsetInfo.isUnstructuredOrScalarlike() &&
+        llvm::any_of(
+            llvm::zip_equal(ptrOffsetInfo.getStructuredRef(), resultShape),
+            [](auto axis) {
+              auto [structured, size] = axis;
+              return structured == PtrOffsetInfo::AxisInfo::structured &&
+                     size > 1;
+            }) &&
         llvm::all_of(mstate->offsets, [](OpFoldResult offset) {
           return isConstantIntValue(offset, 0);
         })) {

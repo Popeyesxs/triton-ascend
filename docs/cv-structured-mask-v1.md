@@ -1,7 +1,7 @@
 # Structured-mask CV program batching (initial experiment)
 
-This note describes the initial static-lane experiment. See the maintained
-[CV block-batching contract](ascend/cv_block_batching.md) for current spatial,
+This note describes the initial static-lane experiment. See the archived
+[CV block-batching contract](https://github.com/elstainniles/triton-ascend/blob/1de72767194177a677fadca5aa4293c582be0e60/docs/ascend/cv_block_batching.md) for the recorded spatial,
 masked batch-matmul, unified guard and AutoBlockify support.
 
 The historical implementation version 21 used a separate CV opt-in. Current

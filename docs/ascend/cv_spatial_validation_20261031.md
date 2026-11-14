@@ -70,7 +70,7 @@ program groups. It does not validate arbitrary CV control flow, multiple dots,
 all shapes/dtypes, or performance of the independent A/B batching path.
 The device fallback cases exercise grid divisibility; they do not claim device
 coverage of every UB/L1/L0 resource-limit failure. See
-[the proof and admission rules](cv_block_batching.md).
+[the archived proof and admission rules](https://github.com/elstainniles/triton-ascend/blob/1de72767194177a677fadca5aa4293c582be0e60/docs/ascend/cv_block_batching.md).
 
 Experiment evidence is retained under `cv-spatial-merge-v1-20261031`:
 `REPORT.zh.md`, all-candidate `performance.csv`, `final/performance.csv`,
