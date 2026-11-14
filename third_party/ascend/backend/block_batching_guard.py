@@ -7,14 +7,10 @@ No tensor data or allocation capacity is read. Unknown domains select baseline.
 """
 import operator
 
-from .block_batching_affine import Affine
+from .block_batching_affine import Affine, GuardFailure
 
 I32_MAX = (1 << 31) - 1
 U64_MAX = (1 << 64) - 1
-
-
-class GuardFailure(ValueError):
-    pass
 
 
 def integer(value):

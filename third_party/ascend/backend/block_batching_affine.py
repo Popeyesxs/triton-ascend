@@ -3,6 +3,14 @@
 from dataclasses import dataclass
 
 
+class GuardFailure(ValueError):
+    """An unestablished proof. Guard entry points turn it into a refusal.
+
+    Defined here rather than in block_batching_guard so that this leaf module
+    can refuse too; block_batching_guard re-exports it for its own importers.
+    """
+
+
 @dataclass(frozen=True)
 class Affine:
     offset: int
@@ -17,9 +25,9 @@ class Affine:
     def add(self, other, sign=1):
         # zip would truncate to the shorter operand and silently drop the
         # remaining coefficients. Under-counting a dimension under-estimates
-        # the proved address range, so a width mismatch is an internal error.
+        # the proved address range, so refuse the proof instead.
         if len(self.coefficients) != len(other.coefficients):
-            raise ValueError("affine operands have different dimensions")
+            raise GuardFailure("AFFINE_DIMENSION_MISMATCH")
         return Affine(self.offset + sign * other.offset,
                       tuple(a + sign * b for a, b in zip(self.coefficients, other.coefficients)))
 
@@ -28,7 +36,7 @@ class Affine:
 
     def bounds(self, counts):
         if len(counts) != len(self.coefficients):
-            raise ValueError("affine bounds domain has the wrong dimensions")
+            raise GuardFailure("AFFINE_DIMENSION_MISMATCH")
         lo = hi = self.offset
         for coefficient, count in zip(self.coefficients, counts):
             delta = coefficient * (count - 1)

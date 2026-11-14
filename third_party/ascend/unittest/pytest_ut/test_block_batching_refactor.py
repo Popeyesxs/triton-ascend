@@ -42,10 +42,35 @@ def test_affine_refuses_mismatched_dimensions_and_keeps_concrete_result_type():
     # Zipping down to the shorter operand used to drop the remaining
     # coefficients silently, which under-estimates the proved address range
     # and is therefore unsafe in the permissive direction. Refuse instead.
-    with pytest.raises(ValueError):
+    with pytest.raises(guard_module.GuardFailure, match='AFFINE_DIMENSION_MISMATCH'):
         Derived(1, (1, 2)).add(guard_module.Affine(2, (3, )))
-    with pytest.raises(ValueError):
+    with pytest.raises(guard_module.GuardFailure, match='AFFINE_DIMENSION_MISMATCH'):
         guard_module.Affine(1, (1, 2)).bounds((4, ))
+
+
+def test_affine_dimension_mismatch_selects_baseline_instead_of_raising(monkeypatch):
+    specification = {
+        'version': 1,
+        'axis': 0,
+        'accesses': [{
+            'root': 0,
+            'bytes': 4,
+            'write': False,
+            'mask': None,
+            'offset': ['addi', 64, ['pid', 0, 32], ['const', 4, 64]],
+        }],
+    }
+    arguments, grid = [4096], (4, 1, 1)
+    assert guard_module.check_guard(specification, arguments, grid, 2) == (True, 'PROVEN_AT_RUNTIME')
+
+    # Model a call site drifting to another width: scalars become one-wide
+    # while program ids stay four-wide. The refusal has to reach the caller as
+    # a baseline selection; an escaping exception would abort the launch.
+    affine = guard_module.Affine
+    monkeypatch.setattr(guard_module, 'Affine', lambda offset, coefficients=(0, ): affine(offset, coefficients))
+    refused = (False, 'AFFINE_DIMENSION_MISMATCH')
+    assert guard_module.check_guard(specification, arguments, grid, 2) == refused
+    assert guard_module.RuntimeGuard(specification, 2)(arguments, grid) == refused
 
 
 @pytest.mark.parametrize('grid,cv,preserve,capture,floor,expected,queries', [
