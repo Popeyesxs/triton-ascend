@@ -137,7 +137,12 @@ bool supportedPredicate(BatchExprRef e, int axis, ArrayRef<int64_t> fused) {
   if (e->kind == K::Unknown || e->kind == K::Induction || e->kind == K::ExtUI ||
       e->kind == K::Trunc || e->kind == K::ULT)
     return false;
-  if (e->kind == K::Program && e->value == axis)
+  // 批处理后的 get_program_id 返回组号，per-lane 的程序号是 group*F + lane。
+  // 商/余数叶子同样由批处理轴派生，整组 lane 只会得到一个谓词值，掩码对
+  // lane>=1 就是错的。地址侧已在 BatchAffineForm 拒绝它们，残差掩码必须一致。
+  if ((e->kind == K::Program || e->kind == K::ProgramQuotient ||
+       e->kind == K::ProgramRemainder) &&
+      e->value == axis)
     return false;
   if (e->kind == K::Coordinate && llvm::is_contained(fused, e->value))
     return false;

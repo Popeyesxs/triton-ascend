@@ -6,6 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Affine:
     offset: int
+    # The v1 element domain is fixed at [grid0, grid1, grid2, extent]. Byte
+    # domains are N-dimensional and must always pass their own width.
     coefficients: tuple = (0, 0, 0, 0)
 
     @property
@@ -13,6 +15,11 @@ class Affine:
         return not any(self.coefficients)
 
     def add(self, other, sign=1):
+        # zip would truncate to the shorter operand and silently drop the
+        # remaining coefficients. Under-counting a dimension under-estimates
+        # the proved address range, so a width mismatch is an internal error.
+        if len(self.coefficients) != len(other.coefficients):
+            raise ValueError("affine operands have different dimensions")
         return Affine(self.offset + sign * other.offset,
                       tuple(a + sign * b for a, b in zip(self.coefficients, other.coefficients)))
 
@@ -20,6 +27,8 @@ class Affine:
         return Affine(self.offset * scale, tuple(c * scale for c in self.coefficients))
 
     def bounds(self, counts):
+        if len(counts) != len(self.coefficients):
+            raise ValueError("affine bounds domain has the wrong dimensions")
         lo = hi = self.offset
         for coefficient, count in zip(self.coefficients, counts):
             delta = coefficient * (count - 1)

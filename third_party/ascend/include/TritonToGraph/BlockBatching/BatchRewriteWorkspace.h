@@ -79,9 +79,12 @@ public:
     auto &state = values[v];
     state.aggregationPresent = true;
     auto old = state.aggregationRows;
-    state.aggregationRows.resize(rows.size());
     bool changed = unknown && !state.aggregationUnknown;
     state.aggregationUnknown |= unknown;
+    // operator|= widens to the longer operand by itself. Resizing to
+    // rows.size() first would let a narrower later merge truncate the
+    // recorded domain, silently dropping rows and reporting that loss as a
+    // change. Widening only keeps the merge monotone.
     state.aggregationRows |= rows;
     return changed || old != state.aggregationRows;
   }

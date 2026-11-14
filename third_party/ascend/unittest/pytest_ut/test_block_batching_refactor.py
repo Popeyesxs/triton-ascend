@@ -32,13 +32,20 @@ def test_affine_arithmetic_preserves_values_and_dimensions(rank):
         a.offset = 0
 
 
-def test_affine_keeps_zip_truncation_and_concrete_result_type():
+def test_affine_refuses_mismatched_dimensions_and_keeps_concrete_result_type():
 
     class Derived(guard_module.Affine):
         pass
 
     assert type(Derived(2).scale(scale=3)) is guard_module.Affine
-    assert Derived(1, (1, 2)).add(guard_module.Affine(2, (3, ))).coefficients == (4, )
+    assert Derived(1, (1, 2)).add(guard_module.Affine(2, (3, 4))).coefficients == (4, 6)
+    # Zipping down to the shorter operand used to drop the remaining
+    # coefficients silently, which under-estimates the proved address range
+    # and is therefore unsafe in the permissive direction. Refuse instead.
+    with pytest.raises(ValueError):
+        Derived(1, (1, 2)).add(guard_module.Affine(2, (3, )))
+    with pytest.raises(ValueError):
+        guard_module.Affine(1, (1, 2)).bounds((4, ))
 
 
 @pytest.mark.parametrize('grid,cv,preserve,capture,floor,expected,queries', [
