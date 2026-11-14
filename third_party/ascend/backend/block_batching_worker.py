@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """One candidate per interpreter. The parent alone binds and publishes artifacts."""
 from contextlib import ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
@@ -338,6 +339,64 @@ def _restore_knobs(knobs, body):
     knobs.propagate_env = body['propagate_env']
 
 
+_active_attempt = ContextVar('ascend_batch_compiler_attempt', default=None)
+
+
+class _CandidateStages:
+    """Child-only cache and stage binding for a single call to Triton's compiler."""
+
+    def __init__(self, source, directory, writer):
+        self.source, self.directory, self.writer = source, directory, writer
+        self.index_root = directory / 'core-cache'
+        self.decline = None
+        self.stop = Exception('candidate stage declined')
+
+    def bind_writer(self, source, index, options):
+        from triton import knobs
+        if (source is not self.source or options.block_batching_factor <= 1
+                or Path(index.cache_dir).parent != self.index_root):
+            raise BatchCompileError('worker stage writer identity mismatch', stage='cache')
+        # The core retains its private group manager. Backend tools and dumps use
+        # the original configuration for the actual compiler stages.
+        vars(knobs.cache)['dir'] = self.original_cache_dir
+        return self.writer
+
+    def wrap(self, ext, stage):
+
+        def run(module, metadata):
+            (self.directory / 'stage').write_text(ext)
+            result = stage(module, metadata)
+            if isinstance(result, BatchDecline):
+                if result.stage != ext:
+                    raise BatchCompileError('decline does not match the running stage', stage=ext)
+                self.decline = result
+                raise self.stop
+            return result
+
+        return run
+
+    def compile(self, compile_single, target, options, env_vars):
+        from triton import knobs
+        from triton.compiler.errors import MLIRCompilationError
+        # The request directory is private and new, so no existing ordinary
+        # group can be hit. The parent separately owns the generation directory.
+        self.index_root.mkdir()
+        if any(Path(self.writer.cache_dir).iterdir()):
+            raise BatchCompileError('candidate generation is not empty', stage='cache')
+        self.original_cache_dir = knobs.cache.dir
+        token = _active_attempt.set(self)
+        try:
+            vars(knobs.cache)['dir'] = str(self.index_root)
+            return compile_single(self.source, target, options, _env_vars=env_vars)
+        except MLIRCompilationError as error:
+            if error.__cause__ is self.stop and self.decline is not None:
+                return self.decline
+            raise
+        finally:
+            vars(knobs.cache)['dir'] = self.original_cache_dir
+            _active_attempt.reset(token)
+
+
 def _compile(body, directory):
     from dataclasses import asdict
     from triton import knobs
@@ -359,16 +418,7 @@ def _compile(body, directory):
     if _variant_key(source, backend, normalized, body['env_vars']) != body['variant']:
         raise ValueError('worker source, backend, options or environment differ')
 
-    class StageCache(FileCacheManager):
-
-        @staticmethod
-        def is_decline(result):
-            return isinstance(result, BatchDecline)
-
-        def begin_stage(self, ext):
-            (directory / 'stage').write_text(ext)
-
-    cache = StageCache(body['stage_key'])
+    cache = FileCacheManager(body['stage_key'])
     stage_dir = Path(cache.cache_dir).resolve()
     timings = {}
     if body['timing']:
@@ -377,7 +427,7 @@ def _compile(body, directory):
             timings.update(asdict(kwargs['times']))
 
         knobs.compilation.listener = collect
-    candidate = compile_single(source, target, options, _env_vars=body['env_vars'], _stage_cache=cache)
+    candidate = _CandidateStages(source, directory, cache).compile(compile_single, target, options, body['env_vars'])
     if isinstance(candidate, BatchDecline):
         return 'NotApplicable', candidate.payload()
     if candidate.hash != body['variant']:

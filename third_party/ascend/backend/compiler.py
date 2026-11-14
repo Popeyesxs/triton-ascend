@@ -74,7 +74,7 @@ from triton.backends.ascend.utils import (
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
 from triton.backends.ascend.block_batching import BatchRequest, analyze_request, IMPLEMENTATION_VERSION
-from triton.backends.ascend.block_batching_worker import BatchCompileError, BatchDecline
+from triton.backends.ascend.block_batching_worker import BatchCompileError, BatchDecline, _active_attempt
 from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching import vv_computation_refusal as batching_vv_computation_refusal
@@ -1891,6 +1891,9 @@ class AscendBackend(BaseBackend):
         from triton.runtime.cache import FileCacheManager
         if type(cache) is not FileCacheManager:
             raise BatchCompileError("custom cache reached frozen source writer", stage="config")
+        attempt = _active_attempt.get()
+        if attempt is not None:
+            return attempt.bind_writer(src, cache, options)
         import uuid
         return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
 
@@ -1898,23 +1901,31 @@ class AscendBackend(BaseBackend):
         from .block_batching import compile_bundle
         return compile_bundle(self, src, options, compile_variant, env_vars=env_vars)
 
+    # Only this hook opts in. A subclass overriding the legacy three-argument
+    # method keeps that convention unless its own method requests the snapshot.
+    compile_bundle.accepts_env_vars = True
+
     def add_stages(self, stages, options, language):
         if self.target.backend == "npu":
             stages["ttir"] = lambda src, metadata: make_ttir(src, metadata, options)
             if options.is_pure_simt:
                 stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options))
-                return
-            stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options)
-            if options.compile_on_910_95:
-                stages["npubin"] = (
-                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))
             else:
-                stages["npubin"] = (
-                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(src, metadata, options))
-            stages["npubin"] = _with_debug_line(stages["npubin"], options)
+                stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options)
+                if options.compile_on_910_95:
+                    stages["npubin"] = (
+                        lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))
+                else:
+                    stages["npubin"] = (
+                        lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(src, metadata, options))
+                stages["npubin"] = _with_debug_line(stages["npubin"], options)
         else:
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
                                       "Please ensure the target backend is set to 'npu'.")
+        attempt = _active_attempt.get()
+        if attempt is not None:
+            for ext, stage in stages.items():
+                stages[ext] = attempt.wrap(ext, stage)
 
     @functools.lru_cache()
     def hash(self):

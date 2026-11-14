@@ -440,3 +440,55 @@ worker._native_report = terminate
         batching.analyze_request('module', batching.BatchRequest(2, 0),
                                  report_listener=lambda report: pytest.fail('invalid completion notification'))
     assert (err.value.kind, err.value.stage) == ('Signal', 'analyze')
+
+
+@pytest.mark.parametrize('outcome', ['success', 'decline', 'unknown', 'wrong_stage'])
+def test_worker_private_group_and_stage_outcome(tmp_path, monkeypatch, compile_errors, outcome):
+    triton = ModuleType('triton')
+    knobs = SimpleNamespace(cache=SimpleNamespace(dir=str(tmp_path / 'ordinary'), dump_dir=str(tmp_path / 'dump')))
+    triton.knobs = knobs
+    monkeypatch.setitem(sys.modules, 'triton', triton)
+    source, target, env = object(), object(), {'explicit': 'caller'}
+    writer = SimpleNamespace(cache_dir=str(tmp_path / 'generation'))
+    Path(writer.cache_dir).mkdir()
+    stages = worker._CandidateStages(source, tmp_path, writer)
+    options = SimpleNamespace(block_batching_factor=2)
+    events = []
+
+    def compile_single(src, compiled_target, opts, *, _env_vars):
+        assert src is source and compiled_target is target and _env_vars is env
+        index = Path(knobs.cache.dir) / 'compiler-key'
+        index.mkdir()
+        assert not any(index.iterdir())
+        assert stages.bind_writer(src, SimpleNamespace(cache_dir=str(index)), opts) is writer
+        assert knobs.cache.dir == str(tmp_path / 'ordinary') and knobs.cache.dump_dir == str(tmp_path / 'dump')
+
+        def lower(module, metadata):
+            assert (tmp_path / 'stage').read_text() == 'ttir'
+            if outcome == 'unknown':
+                raise ValueError('unrecognized compiler error')
+            if outcome != 'success':
+                return worker.BatchDecline('NO_PROGRAM_AXIS', 'ttir' if outcome == 'decline' else 'ttadapter')
+            return 'lowered'
+
+        try:
+            result = stages.wrap('ttir', lower)(object(), {})
+        except Exception as error:
+            raise compile_errors.MLIRCompilationError('stage failed') from error
+        (Path(writer.cache_dir) / 'k.ttir').write_text(result)
+        (index / '__grp__k.json').write_text('private index')
+        events.append('child listener')
+        return result
+
+    if outcome in ('unknown', 'wrong_stage'):
+        with pytest.raises(compile_errors.MLIRCompilationError) as error:
+            stages.compile(compile_single, target, options, env)
+        assert isinstance(error.value.__cause__, ValueError if outcome == 'unknown' else worker.BatchCompileError)
+    else:
+        result = stages.compile(compile_single, target, options, env)
+        assert result == ('lowered' if outcome == 'success' else worker.BatchDecline('NO_PROGRAM_AXIS', 'ttir'))
+    assert events == (['child listener'] if outcome == 'success' else [])
+    assert bool(list(stages.index_root.rglob('__grp__*'))) == (outcome == 'success')
+    assert not list(Path(writer.cache_dir).glob('__grp__*'))
+    assert not (tmp_path / 'ordinary').exists()
+    assert knobs.cache.dir == str(tmp_path / 'ordinary') and worker._active_attempt.get() is None
