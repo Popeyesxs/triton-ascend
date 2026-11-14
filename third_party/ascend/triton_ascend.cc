@@ -10,6 +10,7 @@
 #include "mlir/Transforms/Passes.h" // createInlinerPass
 
 #include "ascend/include/AutoBlockify/Passes.h"
+#include "ascend/include/BlockAuto/Analysis.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
@@ -628,6 +629,13 @@ void init_triton_ascend(py::module &&m) {
 
   auto passes = m.def_submodule("passes");
   // load dialects
+  m.def(
+      "select_block_candidates",
+      [](const std::string &request) {
+        return mlir::triton::ascend::selectBlockCandidates(request);
+      },
+      py::call_guard<py::gil_scoped_release>());
+
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::ascend::TritonAscendDialect>();
