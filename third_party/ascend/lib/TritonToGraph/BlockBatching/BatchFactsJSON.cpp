@@ -8,62 +8,40 @@ namespace {
 llvm::json::Value exprJSON(const BatchExpr &self);
 } // namespace
 
-llvm::json::Value batchAccessesJSON(const BatchEffectProjection &effects) {
+llvm::json::Value batchEffectsJSON(const BatchFacts &facts) {
   llvm::json::Array accesses;
   using A = llvm::json::Array;
-  for (const auto &fact : effects.accesses) {
+  for (auto [id, slot] : llvm::enumerate(facts.effects())) {
+    const auto &fact = facts.access(id);
     A checks, shape, loops;
     for (const auto &step : fact.pointerChecks)
       checks.push_back(batchExprJSON(step));
-    for (int64_t extent : fact.shape)
-      shape.push_back(extent);
-    for (const auto &loop : fact.loops)
-      loops.push_back(batchLoopJSON(loop));
-    accesses.push_back(
-        llvm::json::Object{{"root", fact.root},
-                           {"offset", batchExprJSON(fact.byteOffset)},
-                           {"shape", std::move(shape)},
-                           {"mask", batchExprJSON(fact.mask)},
-                           {"write", fact.write},
-                           {"bytes", fact.bytes},
-                           {"pointer_checks", std::move(checks)},
-                           {"loops", std::move(loops)},
-                           {"volatile", fact.isVolatile},
-                           {"device_address", fact.deviceAddress}});
+    if (slot.jointWidth)
+      shape.push_back(slot.jointWidth);
+    else
+      for (int64_t extent : fact.shape)
+        shape.push_back(extent);
+    for (unsigned loop : fact.loopIDs)
+      loops.push_back(batchLoopJSON(*facts.findLoop(loop)));
+    accesses.push_back(llvm::json::Object{
+        {"root", fact.root},
+        {"offset", batchExprJSON(slot.offset ? slot.offset : fact.byteOffset)},
+        {"shape", std::move(shape)},
+        {"mask", batchExprJSON(slot.mask ? slot.mask : fact.mask)},
+        {"write", fact.write},
+        {"bytes", fact.bytes},
+        {"pointer_checks", std::move(checks)},
+        {"loops", std::move(loops)},
+        {"volatile", fact.isVolatile},
+        {"device_address", fact.deviceAddress}});
   }
   return llvm::json::Object{{"version", 2}, {"accesses", std::move(accesses)}};
 }
 
-// Expand loop references only at the legacy wire boundary. Keep the same
-// encoder so expression widths, member slots and joint-store checks cannot
-// drift.
-llvm::json::Value batchEffectsJSON(const BatchFacts &facts) {
-  BatchEffectProjection projection;
-  for (const auto &fact : facts.effects()) {
-    BatchAccessFact value{fact.root,
-                          fact.bytes,
-                          fact.write,
-                          fact.shape,
-                          fact.byteOffset,
-                          fact.mask,
-                          fact.pointerChecks,
-                          {},
-                          fact.isVolatile,
-                          fact.deviceAddress,
-                          fact.normalizedPointer};
-    for (unsigned id : fact.loopIDs) {
-      const auto *loop = facts.findLoop(id);
-      assert(loop && "unknown VV guard loop ID");
-      value.loops.push_back(*loop);
-    }
-    projection.accesses.push_back(std::move(value));
-  }
-  return batchAccessesJSON(projection);
-}
-
 namespace {
 llvm::json::Value batchProofJSON(const BatchFacts &facts,
-                                 const BatchProofObligations &proof, int axis,
+                                 llvm::ArrayRef<BatchEffectObligation> effects,
+                                 llvm::ArrayRef<unsigned> terminalIDs, int axis,
                                  int64_t factor) {
   auto wire = batchEffectsJSON(facts);
   auto &object = *wire.getAsObject();
@@ -74,14 +52,14 @@ llvm::json::Value batchProofJSON(const BatchFacts &facts,
   object["factor"] = factor;
   object["axis"] = axis;
   llvm::json::Array obligations, terminalReads;
-  for (const auto &obligation : proof.effects)
+  for (const auto &obligation : effects)
     obligations.push_back(llvm::json::Object{
         {"access_id", static_cast<int64_t>(obligation.accessID)},
         {"rule", batchEffectRuleName(obligation.rule)},
         {"proof", obligation.proof == BatchEffectProof::ByteDomain
                       ? "byte_domain"
                       : "lane_correspondence"}});
-  for (unsigned id : proof.terminalReads)
+  for (unsigned id : terminalIDs)
     terminalReads.push_back(id);
   object["terminal_read_ids"] = std::move(terminalReads);
   object["obligations"] = std::move(obligations);
@@ -91,26 +69,63 @@ llvm::json::Value batchProofJSON(const BatchFacts &facts,
 
 // Refusal diagnostics are encoded on demand by the outer transaction. They
 // are never accepted as an execution contract or stored in a planning object.
-std::optional<std::string>
-encodeBatchPendingGuard(const BatchFacts &facts,
-                        const BatchProofObligations &proof, int axis,
-                        int64_t factor) {
-  if (!proof.validFor(facts))
+std::optional<std::string> encodeBatchPendingGuard(
+    const BatchFacts &facts, llvm::ArrayRef<BatchEffectObligation> effects,
+    llvm::ArrayRef<unsigned> terminalIDs, int axis, int64_t factor) {
+  if (!BatchPlan::validEffects(facts, effects, terminalIDs))
     return std::nullopt;
-  return llvm::formatv("{0}", batchProofJSON(facts, proof, axis, factor)).str();
+  return llvm::formatv(
+             "{0}", batchProofJSON(facts, effects, terminalIDs, axis, factor))
+      .str();
 }
 
-std::optional<std::string> encodeBatchGuard(const BatchGuardSpec &spec) {
-  const auto &plan = spec.plan();
-  auto wire =
-      batchProofJSON(plan.facts(), plan.proof(), plan.axis(), plan.factor());
+BatchResult<std::string> encodeBatchGuard(const BatchAppliedRewrite &applied) {
+  using Result = BatchResult<std::string>;
+  const auto &plan = applied.plan();
+  auto wire = batchProofJSON(plan.facts(), plan.effects(), plan.terminalReads(),
+                             plan.axis(), plan.factor());
   auto &object = *wire.getAsObject();
   auto &obligations = *object.getArray("obligations");
   llvm::json::Array layoutChecks;
-  for (const auto &layout : spec.applied().layouts())
+  for (const auto &layout : applied.layouts()) {
+    const auto &planned = plan.layouts()[layout.accessID];
     if (layout.rewritten)
-      (*obligations[layout.layout.accessID].getAsObject())["proof"] =
-          "byte_domain";
+      (*obligations[layout.accessID].getAsObject())["proof"] = "byte_domain";
+    if (layout.runtimeGuardJSON.empty() &&
+        !(planned.symbolic && layout.rewritten))
+      continue;
+    auto invalid = [&] {
+      return Result::error({"invalid finalized symbolic layout guard",
+                            "encode",
+                            {},
+                            {},
+                            {},
+                            layout.accessID});
+    };
+    if (!planned.symbolic || !layout.rewritten)
+      return invalid();
+    auto parsed = llvm::json::parse(layout.runtimeGuardJSON);
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return invalid();
+    }
+    const auto *guard = parsed->getAsObject();
+    const auto &access = plan.facts().access(layout.accessID);
+    if (!guard || guard->getInteger("version") != 1 ||
+        guard->getInteger("axis") != plan.axis() ||
+        guard->getInteger("factor") != plan.factor() ||
+        guard->getInteger("access_id") != layout.accessID ||
+        guard->getInteger("root") != access.root ||
+        guard->getInteger("bytes") != access.bytes ||
+        !guard->getArray("loops") ||
+        guard->getArray("loops")->size() != access.loopIDs.size())
+      return invalid();
+    for (llvm::StringRef key :
+         {"shape", "checks", "positive", "pointer_checks"})
+      if (!guard->getArray(key) || guard->getArray(key)->empty())
+        return invalid();
+    layoutChecks.push_back(std::move(*parsed));
+  }
   if (plan.preservesGrid())
     object["loop_schedule"] =
         llvm::json::Object{{"version", 1},
@@ -118,22 +133,11 @@ std::optional<std::string> encodeBatchGuard(const BatchGuardSpec &spec) {
                            {"grid_policy", "preserve"},
                            {"factor", plan.factor()},
                            {"loop", batchLoopJSON(*plan.groupedLoop())}};
-  // The legacy layout lowerer owns its byte-domain proof. Decode that wire
-  // only here at the compatibility boundary, never inside planning or dispatch.
-  for (const auto &layout : spec.applied().layouts())
-    if (layout.rewritten && !layout.runtimeGuardJSON.empty()) {
-      auto parsed = llvm::json::parse(layout.runtimeGuardJSON);
-      if (!parsed) {
-        llvm::consumeError(parsed.takeError());
-        return std::nullopt;
-      }
-      if (!parsed->getAsObject())
-        return std::nullopt;
-      layoutChecks.push_back(std::move(*parsed));
-    }
   if (!layoutChecks.empty())
     object["layout_checks"] = std::move(layoutChecks);
-  return llvm::formatv("{0}", wire).str();
+  for (const auto &entry : applied.matrixExtensions())
+    object[entry.first.str()] = entry.second;
+  return Result::success(llvm::formatv("{0}", wire).str());
 }
 
 llvm::json::Value batchExprJSON(const BatchExprRef &expr) {

@@ -3,6 +3,7 @@
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_BATCH_REQUEST_H
 
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
+#include "TritonToGraph/BlockBatching/BatchResult.h"
 #include "TritonToGraph/BlockBatching/ControlFlowModels.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
@@ -58,6 +59,10 @@ std::string describeBatchComputation(Operation *root);
 void markVvAggregations(Operation *root);
 LogicalResult finalizeVvComputation(Operation *root, std::string &description,
                                     bool sequential, int64_t factor);
+BatchDiagnostic snapshotBatchDiagnostic(Operation *op, llvm::StringRef stage,
+                                        llvm::StringRef reason);
+void applyBatchDiagnostic(BatchAnalysisReport &report,
+                          const BatchDiagnostic &detail);
 void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
                         llvm::StringRef reason);
 

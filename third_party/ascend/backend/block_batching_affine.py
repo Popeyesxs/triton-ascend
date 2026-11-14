@@ -1,16 +1,28 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Shared arithmetic only; guard versions retain their own domains and budgets."""
+"""Integer arithmetic shared by the element and byte domain proofs."""
+from dataclasses import dataclass
 
 
-def affine_uniform(value):
-    return not any(value.coefficients)
+@dataclass(frozen=True)
+class Affine:
+    offset: int
+    coefficients: tuple = (0, 0, 0, 0)
 
+    @property
+    def uniform(self):
+        return not any(self.coefficients)
 
-def affine_add(lhs, rhs, sign, result_type):
-    # Preserve the legacy zip semantics and the caller's concrete result type.
-    return result_type(lhs.offset + sign * rhs.offset,
-                       tuple(a + sign * b for a, b in zip(lhs.coefficients, rhs.coefficients)))
+    def add(self, other, sign=1):
+        return Affine(self.offset + sign * other.offset,
+                      tuple(a + sign * b for a, b in zip(self.coefficients, other.coefficients)))
 
+    def scale(self, scale):
+        return Affine(self.offset * scale, tuple(c * scale for c in self.coefficients))
 
-def affine_scale(value, factor, result_type):
-    return result_type(value.offset * factor, tuple(c * factor for c in value.coefficients))
+    def bounds(self, counts):
+        lo = hi = self.offset
+        for coefficient, count in zip(self.coefficients, counts):
+            delta = coefficient * (count - 1)
+            lo += min(0, delta)
+            hi += max(0, delta)
+        return lo, hi

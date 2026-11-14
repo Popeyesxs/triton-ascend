@@ -3,11 +3,12 @@
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_PLAN_H
 #include "TritonToGraph/BlockBatching/BatchFacts.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutFacts.h"
+#include "TritonToGraph/BlockBatching/BatchLoopSchedule.h"
+#include "TritonToGraph/BlockBatching/BatchResult.h"
 #include <memory>
 #include <optional>
 
 namespace mlir::triton::cfg {
-enum class BatchSchedule { ProgramLanes, SequentialIterations };
 // Strategy describes lowering semantics, not a second class hierarchy.
 enum class BatchStrategy {
   VectorLanes,
@@ -42,11 +43,64 @@ struct BatchEffectObligation {
   BatchEffectRule rule;
   BatchEffectProof proof;
 };
-// Owned planning output. These are obligations, not proofs of runtime inputs.
-struct BatchProofObligations {
-  llvm::SmallVector<BatchEffectObligation, 0> effects;
-  llvm::SmallVector<unsigned, 0> terminalReads;
-  bool validFor(const BatchFacts &facts) const {
+// All consumers share exactly the decision validated by createChecked. Layout
+// and effect buffers transfer only on success so refusals can still report
+// the original obligations.
+class BatchPlan {
+public:
+  BatchPlan(const BatchPlan &) = delete;
+  BatchPlan &operator=(const BatchPlan &) = delete;
+  static BatchResult<std::shared_ptr<const BatchPlan>>
+  createChecked(std::shared_ptr<const BatchFacts> facts, int axis,
+                int64_t factor, BatchStrategy strategy,
+                std::optional<BatchLogicalAxis> logicalAxis,
+                llvm::SmallVector<BatchLayoutPlan, 0> &&layouts,
+                llvm::SmallVector<BatchEffectObligation, 0> &&effects,
+                llvm::SmallVector<unsigned, 0> &&terminalReads) {
+    using Result = BatchResult<std::shared_ptr<const BatchPlan>>;
+    auto invalid = [](std::string reason,
+                      std::optional<unsigned> sourceID = {}) {
+      return Result::error({std::move(reason), "plan", {}, {}, {}, sourceID});
+    };
+    if (!facts || axis < 0 || axis >= 3 || factor <= 1 || factor > INT32_MAX)
+      return invalid("INVALID_BATCH_PLAN_REQUEST");
+    if (!validEffects(*facts, effects, terminalReads))
+      return invalid("INVALID_BATCH_EFFECT_OBLIGATIONS");
+    if (logicalAxis &&
+        (logicalAxis->gridAxis != axis ||
+         !facts->findLoop(logicalAxis->loopID) || logicalAxis->chunk < 1 ||
+         (logicalAxis->distribution != BatchLogicalAxis::Blocked &&
+          logicalAxis->distribution != BatchLogicalAxis::Cyclic)))
+      return invalid("INVALID_BATCH_LOGICAL_AXIS");
+    switch (strategy) {
+    case BatchStrategy::VectorLanes:
+    case BatchStrategy::MatrixBatch:
+      if (layouts.size() != facts->accesses().size())
+        return invalid("INCOMPLETE_BATCH_LAYOUT_MAPPING");
+      for (unsigned id = 0; id < layouts.size(); ++id)
+        if (layouts[id].accessID != id)
+          return invalid("INVALID_BATCH_LAYOUT_MAPPING", id);
+      break;
+    case BatchStrategy::SequentialLoop:
+      if (!logicalAxis)
+        return invalid("MISSING_BATCH_LOGICAL_AXIS");
+      [[fallthrough]];
+    case BatchStrategy::MatrixSpatial:
+    case BatchStrategy::MatrixStaticLanes:
+      if (!layouts.empty())
+        return invalid("UNEXPECTED_BATCH_LAYOUTS");
+      break;
+    default:
+      return invalid("INVALID_BATCH_STRATEGY");
+    }
+    return Result::success(std::shared_ptr<const BatchPlan>(new BatchPlan(
+        std::move(facts), axis, factor, strategy, logicalAxis,
+        std::move(layouts), std::move(effects), std::move(terminalReads))));
+  }
+
+  static bool validEffects(const BatchFacts &facts,
+                           llvm::ArrayRef<BatchEffectObligation> effects,
+                           llvm::ArrayRef<unsigned> terminalReads) {
     if (effects.size() != facts.accesses().size())
       return false;
     for (unsigned id = 0; id < effects.size(); ++id)
@@ -60,59 +114,6 @@ struct BatchProofObligations {
         return false;
     return true;
   }
-};
-
-// An accepted decision owns immutable original-domain facts and layout plans.
-// Grid and hidden ABI are derived from schedule, never independently set flags.
-class BatchPlan {
-public:
-  static std::optional<BatchPlan>
-  programLanes(std::shared_ptr<const BatchFacts> facts, int axis,
-               int64_t factor, llvm::SmallVector<BatchLayoutPlan, 0> layouts,
-               BatchProofObligations proof) {
-    if (!validRequest(facts, axis, factor) ||
-        layouts.size() != facts->accesses().size() || !proof.validFor(*facts))
-      return std::nullopt;
-    for (unsigned id = 0; id < layouts.size(); ++id)
-      if (layouts[id].accessID != id)
-        return std::nullopt;
-    return BatchPlan(std::move(facts), axis, factor,
-                     BatchSchedule::ProgramLanes, BatchStrategy::VectorLanes,
-                     {}, std::move(layouts), std::move(proof));
-  }
-  static std::optional<BatchPlan>
-  sequentialIterations(std::shared_ptr<const BatchFacts> facts, int axis,
-                       int64_t factor, unsigned loopID,
-                       BatchProofObligations proof) {
-    if (!validRequest(facts, axis, factor) || !facts->findLoop(loopID) ||
-        !proof.validFor(*facts))
-      return std::nullopt;
-    return BatchPlan(
-        std::move(facts), axis, factor, BatchSchedule::SequentialIterations,
-        BatchStrategy::SequentialLoop, loopID, {}, std::move(proof));
-  }
-  static std::optional<BatchPlan>
-  matrixLanes(std::shared_ptr<const BatchFacts> facts, int axis, int64_t factor,
-              BatchStrategy strategy,
-              llvm::SmallVector<BatchLayoutPlan, 0> layouts,
-              BatchProofObligations proof) {
-    if (!validRequest(facts, axis, factor) || !proof.validFor(*facts) ||
-        (strategy != BatchStrategy::MatrixStaticLanes &&
-         strategy != BatchStrategy::MatrixSpatial &&
-         strategy != BatchStrategy::MatrixBatch))
-      return std::nullopt;
-    if (strategy == BatchStrategy::MatrixBatch) {
-      if (layouts.size() != facts->accesses().size())
-        return std::nullopt;
-      for (unsigned id = 0; id < layouts.size(); ++id)
-        if (layouts[id].accessID != id)
-          return std::nullopt;
-    } else if (!layouts.empty())
-      return std::nullopt;
-    return BatchPlan(std::move(facts), axis, factor,
-                     BatchSchedule::ProgramLanes, strategy, {},
-                     std::move(layouts), std::move(proof));
-  }
   BatchStrategy strategy() const { return selectedStrategy; }
   bool isMatrix() const {
     return selectedStrategy == BatchStrategy::MatrixStaticLanes ||
@@ -122,38 +123,43 @@ public:
   const BatchFacts &facts() const { return *sourceFacts; }
   int axis() const { return selectedAxis; }
   int64_t factor() const { return laneWidth; }
-  BatchSchedule schedule() const { return selectedSchedule; }
+  BatchSchedule schedule() const {
+    return selectedStrategy == BatchStrategy::SequentialLoop
+               ? BatchSchedule::SequentialIterations
+               : BatchSchedule::ProgramLanes;
+  }
   bool preservesGrid() const {
-    return selectedSchedule == BatchSchedule::SequentialIterations;
+    return schedule() == BatchSchedule::SequentialIterations;
   }
   unsigned hiddenExtentCount() const { return preservesGrid() ? 0 : 3; }
+  const std::optional<BatchLogicalAxis> &logicalAxis() const {
+    return loopAxis;
+  }
   const BatchLoopFact *groupedLoop() const {
-    return loopID ? sourceFacts->findLoop(*loopID) : nullptr;
+    return preservesGrid() ? sourceFacts->findLoop(loopAxis->loopID) : nullptr;
   }
   llvm::ArrayRef<BatchLayoutPlan> layouts() const { return layoutPlans; }
-  const BatchProofObligations &proof() const { return proofObligations; }
+  llvm::ArrayRef<BatchEffectObligation> effects() const { return effectRules; }
+  llvm::ArrayRef<unsigned> terminalReads() const { return terminalReadIDs; }
 
 private:
-  static bool validRequest(const std::shared_ptr<const BatchFacts> &facts,
-                           int axis, int64_t factor) {
-    return facts && axis >= 0 && axis < 3 && factor > 1 && factor <= INT32_MAX;
-  }
   BatchPlan(std::shared_ptr<const BatchFacts> facts, int axis, int64_t factor,
-            BatchSchedule schedule, BatchStrategy strategy,
-            std::optional<unsigned> loop,
-            llvm::SmallVector<BatchLayoutPlan, 0> layouts,
-            BatchProofObligations proof)
+            BatchStrategy strategy, std::optional<BatchLogicalAxis> logicalAxis,
+            llvm::SmallVector<BatchLayoutPlan, 0> &&layouts,
+            llvm::SmallVector<BatchEffectObligation, 0> &&effects,
+            llvm::SmallVector<unsigned, 0> &&terminalReads)
       : sourceFacts(std::move(facts)), selectedAxis(axis), laneWidth(factor),
-        selectedSchedule(schedule), selectedStrategy(strategy), loopID(loop),
-        layoutPlans(std::move(layouts)), proofObligations(std::move(proof)) {}
+        selectedStrategy(strategy), loopAxis(logicalAxis),
+        layoutPlans(std::move(layouts)), effectRules(std::move(effects)),
+        terminalReadIDs(std::move(terminalReads)) {}
   std::shared_ptr<const BatchFacts> sourceFacts;
   int selectedAxis;
   int64_t laneWidth;
-  BatchSchedule selectedSchedule;
   BatchStrategy selectedStrategy;
-  std::optional<unsigned> loopID;
+  std::optional<BatchLogicalAxis> loopAxis;
   llvm::SmallVector<BatchLayoutPlan, 0> layoutPlans;
-  BatchProofObligations proofObligations;
+  llvm::SmallVector<BatchEffectObligation, 0> effectRules;
+  llvm::SmallVector<unsigned, 0> terminalReadIDs;
 };
 } // namespace mlir::triton::cfg
 #endif

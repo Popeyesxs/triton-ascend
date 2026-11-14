@@ -640,7 +640,7 @@ index c572f81e3..4b4332368 100644
  
  
 diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
-index d4872a4..e9c8909 100644
+index d4872a4..07f885e 100644
 --- a/python/triton/compiler/compiler.py
 +++ b/python/triton/compiler/compiler.py
 @@ -10,12 +10,16 @@ from ..runtime.autotuner import OutOfResources
@@ -660,7 +660,7 @@ index d4872a4..e9c8909 100644
  
  # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
  #    and any following whitespace
-@@ -223,7 +227,40 @@ class CompileTimer:
+@@ -223,7 +227,45 @@ class CompileTimer:
          )
  
  
@@ -693,15 +693,37 @@ index d4872a4..e9c8909 100644
 +    backend = make_backend(target)
 +    hook = getattr(backend, "compile_bundle", None)
 +    if hook is not None and options and options.get("block_batching_factor", 1) != 1:
-+        return hook(src, options, lambda variant, frozen_src=None: _compile(src if frozen_src is None else frozen_src, target, variant, _env_vars))
++        env_vars = dict(get_cache_invalidating_env_vars() if _env_vars is None else _env_vars)
++
++        def compile_baseline(variant, frozen_src=None):
++            return _compile(src if frozen_src is None else frozen_src, target, variant, env_vars)
++
++        return hook(src, options, compile_baseline, env_vars=env_vars)
 +    return _compile(src, target, options, _env_vars)
 +
 +
-+def _compile(src, target=None, options=None, _env_vars=None):
++def _compile(src, target=None, options=None, _env_vars=None, *, _stage_cache=None):
      compilation_listener = knobs.compilation.listener
      if compilation_listener:
          timer = CompileTimer()
-@@ -266,7 +303,8 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -245,7 +287,7 @@ def compile(src, target=None, options=None, _env_vars=None):
+     env_vars = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
+     key = get_cache_key(src, backend, options, env_vars=env_vars)
+     hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+-    fn_cache_manager = get_cache_manager(hash)
++    fn_cache_manager = get_cache_manager(hash) if _stage_cache is None else _stage_cache
+     # For dumping/overriding only hash the source as we want it to be independent of triton
+     # core changes to make it easier to track kernels by hash.
+     enable_override = knobs.compilation.override
+@@ -259,14 +301,15 @@ def compile(src, target=None, options=None, _env_vars=None):
+     # the file name to 150 characters to be safe.
+     file_name = src.name[:150]
+     metadata_filename = f"{file_name}.json"
+-    metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
++    metadata_group = {} if _stage_cache is not None else (fn_cache_manager.get_group(metadata_filename) or {})
+     metadata_path = metadata_group.get(metadata_filename)
+     always_compile = knobs.compilation.always_compile
+     if not always_compile and metadata_path is not None:
          # cache hit!
          res = CompiledKernel(src, metadata_group, hash)
          if compilation_listener:
@@ -711,18 +733,20 @@ index d4872a4..e9c8909 100644
                  src=src,
                  metadata=res.metadata._asdict(),
                  metadata_group=metadata_group,
-@@ -275,6 +313,10 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -275,6 +318,12 @@ def compile(src, target=None, options=None, _env_vars=None):
              )
          return res
  
-+    writer_factory = getattr(backend, "make_compilation_writer", None)
-+    stage_cache_manager = (writer_factory(src, options, fn_cache_manager, enable_override)
-+                           if writer_factory is not None else fn_cache_manager)
++    stage_cache_manager = fn_cache_manager
++    if _stage_cache is None:
++        writer_factory = getattr(backend, "make_compilation_writer", None)
++        if writer_factory is not None:
++            stage_cache_manager = writer_factory(src, options, fn_cache_manager, enable_override)
 +
      # initialize metadata
      metadata = {
          "hash": hash,
-@@ -308,10 +350,10 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -308,10 +357,10 @@ def compile(src, target=None, options=None, _env_vars=None):
  
      if ir_source:
          ir_filename = f"{file_name}.{src.ext}"
@@ -735,13 +759,17 @@ index d4872a4..e9c8909 100644
  
      use_ir_loc = knobs.compilation.use_ir_loc
      if ir_source and use_ir_loc:
-@@ -321,7 +363,25 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -321,7 +370,29 @@ def compile(src, target=None, options=None, _env_vars=None):
      if compilation_listener:
          timer.finished_ir_initialization()
      for ext, compile_ir in list(stages.items())[first_stage:]:
 -        next_module = compile_ir(module, metadata)
++        if _stage_cache is not None:
++            _stage_cache.begin_stage(ext)
 +        try:
 +            next_module = compile_ir(module, metadata)
++            if _stage_cache is not None and _stage_cache.is_decline(next_module):
++                return next_module
 +        except Exception as e:
 +            if (ext == "ttadapter"):
 +                stage_name = "ConvertTritonIRToLinalgIR"
@@ -762,7 +790,7 @@ index d4872a4..e9c8909 100644
          ir_filename = f"{file_name}.{ext}"
          if fn_override_manager is None:
              # Users can override kernels at scale by setting `ir_override` in autotune config
-@@ -331,9 +391,9 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -331,9 +402,9 @@ def compile(src, target=None, options=None, _env_vars=None):
          elif full_name := fn_override_manager.get_file(ir_filename):
              print(f"\nOverriding kernel with file {full_name}")
              next_module = parse(full_name, ext, context)
@@ -775,7 +803,7 @@ index d4872a4..e9c8909 100644
          if fn_dump_manager is not None:
              fn_dump_manager.put(next_module, ir_filename)
              if ext == "cubin":
-@@ -341,21 +401,21 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -341,21 +412,23 @@ def compile(src, target=None, options=None, _env_vars=None):
                  fn_dump_manager.put(sass, file_name + ".sass")
          # use an env variable to parse ir from file
          if use_ir_loc == ext:
@@ -790,7 +818,10 @@ index d4872a4..e9c8909 100644
 -    metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
 +    metadata_group[metadata_filename] = stage_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                               binary=False)
-     fn_cache_manager.put_group(metadata_filename, metadata_group)
+-    fn_cache_manager.put_group(metadata_filename, metadata_group)
++    # A supervised candidate becomes cache-visible after the parent binds its guard.
++    if _stage_cache is None:
++        fn_cache_manager.put_group(metadata_filename, metadata_group)
  
      # notify any listener
      if compilation_listener:
@@ -801,7 +832,7 @@ index d4872a4..e9c8909 100644
      # return handle to compiled kernel
      return CompiledKernel(src, metadata_group, hash)
  
-@@ -402,7 +462,9 @@ def _raise_error(err, *args, **kwargs):
+@@ -402,7 +475,9 @@ def _raise_error(err, *args, **kwargs):
  
  
  class CompiledKernel:
@@ -812,7 +843,7 @@ index d4872a4..e9c8909 100644
      def __init__(self, src, metadata_group, hash):
          from collections import namedtuple
          metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-@@ -420,8 +482,10 @@ class CompiledKernel:
+@@ -420,8 +495,10 @@ class CompiledKernel:
          # stores the text of each level of IR that was generated during compilation
          asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
          binary_ext = backend.binary_ext
@@ -824,7 +855,7 @@ index d4872a4..e9c8909 100644
              for file in asm_files
          })
          self.metadata_group = metadata_group
-@@ -432,8 +496,33 @@ class CompiledKernel:
+@@ -432,8 +509,33 @@ class CompiledKernel:
          self.module = None
          self.function = None
          self._run = None
@@ -858,7 +889,7 @@ index d4872a4..e9c8909 100644
          if self.module is not None:
              return
  
-@@ -459,20 +548,19 @@ class CompiledKernel:
+@@ -459,20 +561,19 @@ class CompiledKernel:
              max_tmem_size = 512  # tmem size in number of columns
              if self.metadata.tmem_size > max_tmem_size:
                  raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))

@@ -1,7 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #ifndef TRITON_TO_GRAPH_BLOCK_BATCHING_FACTS_JSON_H
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_FACTS_JSON_H
-#include "TritonToGraph/BlockBatching/BatchAccessFact.h"
+#include "TritonToGraph/BlockBatching/BatchFacts.h"
 #include "TritonToGraph/BlockBatching/BatchLoopFacts.h"
 #include "TritonToGraph/BlockBatching/BatchPlan.h"
 #include "llvm/Support/JSON.h"
@@ -18,13 +18,12 @@
 // 这两个纯数据类型，不认它们的 JSON 形态。
 namespace mlir::triton::cfg {
 
-llvm::json::Value batchAccessesJSON(const BatchEffectProjection &effects);
 llvm::json::Value batchEffectsJSON(const BatchFacts &facts);
-// Diagnostic-only pending proof; successful contracts require BatchGuardSpec.
-std::optional<std::string>
-encodeBatchPendingGuard(const BatchFacts &facts,
-                        const BatchProofObligations &proof, int axis,
-                        int64_t factor);
+// Diagnostic-only pending proof; successful contracts require a finalized
+// rewrite.
+std::optional<std::string> encodeBatchPendingGuard(
+    const BatchFacts &facts, llvm::ArrayRef<BatchEffectObligation> effects,
+    llvm::ArrayRef<unsigned> terminalReads, int axis, int64_t factor);
 
 llvm::json::Value batchExprJSON(const BatchExprRef &expr);
 

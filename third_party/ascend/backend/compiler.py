@@ -73,7 +73,8 @@ from triton.backends.ascend.utils import (
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
-from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
+from triton.backends.ascend.block_batching import BatchRequest, analyze_request, IMPLEMENTATION_VERSION
+from triton.backends.ascend.block_batching_worker import BatchCompileError, BatchDecline
 from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching import vv_computation_refusal as batching_vv_computation_refusal
@@ -303,6 +304,8 @@ def _with_debug_line(npubin_stage, options):
 
     def stage(src, metadata):
         artifact = npubin_stage(src, metadata)
+        if isinstance(artifact, BatchDecline):
+            return artifact
         return rewrite_debug_line(artifact, metadata=metadata, options=options)
 
     return stage
@@ -380,7 +383,7 @@ def make_ttir(mod, metadata, opt):
         if opt.debug:
             get_dump_manager(metadata['hash']).put(str(mod), 'block_batching.normalized.ttir', binary=False)
         if opt.block_batching_factor > 64:
-            raise BatchingRejected("FACTOR_EXCEEDS_LANE_CAPACITY")
+            return BatchDecline("FACTOR_EXCEEDS_LANE_CAPACITY", "ttir")
         rewrite = getattr(ascend.passes.ttir, "rewrite_block_batching", None)
         if rewrite is None:
             raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
@@ -403,17 +406,19 @@ def make_ttir(mod, metadata, opt):
         if _remove_attr is not None:
             _remove_attr(mod, "hacc.block_batching_grid")
         if report.get("implementation_version") != opt.block_batching_implementation:
-            raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
+            raise BatchCompileError("REWRITER_IMPLEMENTATION_MISMATCH", stage="ttir")
         if report.get("lane_width") != opt.block_batching_factor and report["compile_status"] == "REWRITTEN":
-            raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
+            raise BatchCompileError("CANDIDATE_LAYOUT_MISMATCH", stage="ttir")
         # Retain native evidence even when admission fails before layout.
         report["computation"] = json.loads(report.pop("computation_json", "") or "{}")
-        if report["compile_status"] != "REWRITTEN":
+        if report["compile_status"] not in ("REWRITTEN", "REJECTED"):
+            raise BatchCompileError("unknown rewrite status", stage="ttir")
+        if report["compile_status"] == "REJECTED":
             analysis = {
                 key: report[key]
                 for key in ("selected_axis", "operations", "computation", "operation", "context", "location")
             }
-            raise BatchingRejected(report["reason"], analysis={"stage": "source", **analysis})
+            return BatchDecline(report["reason"], "ttir", analysis={"stage": "source", **analysis})
         report["layout"] = json.loads(report.pop("layout_json"))
         report["layout"]["requested_policy"] = opt.block_batching_layout
         report["layout"]["selected_policy"] = layout_policy
@@ -424,20 +429,20 @@ def make_ttir(mod, metadata, opt):
             from .block_batching_guard_v2 import static_cv_mask_refusal
             reason = static_cv_mask_refusal(report["guard"])
             if reason:
-                raise BatchingRejected(reason)
+                return BatchDecline(reason, "ttir")
         from .block_batching_guard_v3 import bind_plan
         bind_plan(report["guard"], batch_source)
         report["owner"] = "block_batching"
         refusal = batching_vv_computation_refusal(report)
         if refusal:
-            raise BatchingRejected(
-                refusal,
+            return BatchDecline(
+                refusal, "ttir",
                 analysis={"stage": "source", "computation": report["computation"], "operations": report["operations"]})
         report["admission"] = {"version": 1, "source": "proven", "layout": "pending", "memory_lowering": "pending"}
         refusal = batching_vv_layout_refusal(report)
         if refusal:
-            raise BatchingRejected(
-                refusal,
+            return BatchDecline(
+                refusal, "ttir",
                 analysis={key: report[key]
                           for key in ("selected_axis", "operations", "layout", "computation")})
         report["admission"]["layout"] = "proven"
@@ -589,7 +594,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             # Ownership has served every TA mapping/lowering gate. Preserve it
             # in the immutable manifest, not as an unknown HACC LLVM attribute.
             if not ascend.passes.ttir.clear_block_batching_owner(mod):
-                raise BatchingRejected("MAPPING_OWNER_LOST")
+                raise BatchCompileError("MAPPING_OWNER_LOST", stage="ttadapter")
 
         linalg_text = _serialize_module(mod, opt)
         if "block_batching" in metadata:
@@ -619,7 +624,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                     for key in ("selected_axis", "operations", "layout", "computation", "admission")
                 }
                 report["admission"]["memory_lowering"] = "rejected"
-                raise BatchingRejected(refusal, analysis={"stage": "ttadapter", **analysis})
+                return BatchDecline(refusal, "ttadapter", analysis={"stage": "ttadapter", **analysis})
             report["admission"]["memory_lowering"] = "proven"
 
         return linalg_text
@@ -805,7 +810,7 @@ def _masked_batch_compile_options(metadata, compiler_path):
     # for transposed f32 K tails on the packaged batch-DMA implementation.
     if (not metadata["target"].arch.startswith("Ascend950")
             or report.get("guard", {}).get("require_same_fractal_bounds") is not True):
-        raise BatchingRejected("CV_MASKED_BATCH_MEMORY_LOWERING_UNSUPPORTED")
+        return BatchDecline("CV_MASKED_BATCH_MEMORY_LOWERING_UNSUPPORTED", "npubin")
     report["cv_memory_lowering"] = "full_reduction_guard_v3"
     return []
 
@@ -819,8 +824,8 @@ def get_auto_bind_sub_block_option(metadata):
 
 
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
-    stdout = stdout_bytes.decode('utf-8') if stdout_bytes else ''
-    stderr = stderr_bytes.decode('utf-8') if stderr_bytes else ''
+    stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
+    stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
     combined = stdout + stderr
     if not combined.strip():
         combined = "No output captured."
@@ -830,6 +835,26 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
 
     dump_manager = get_dump_manager(metadata_hash)
     dump_manager.put(Path(output_path).read_text(encoding='utf-8'), "kernel.npuir.mlir", binary=False)
+
+
+def _run_vendor_npubin(cmd, env, opt, metadata, tmpdir, bin_path, *, cv_resources):
+    from .block_batching_vendor import classify_vendor_failure, require_candidate_binary
+    report = metadata.get("block_batching")
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, check=True)
+    except subprocess.CalledProcessError as error:
+        if opt.debug:
+            _save_npuir_debug_output(error.stdout, error.stderr, tmpdir, metadata["hash"])
+        if report is not None:
+            decline = classify_vendor_failure(error, report, opt, cv_resources=cv_resources)
+            if decline is not None:
+                return decline
+        raise
+    if opt.debug:
+        _save_npuir_debug_output(result.stdout, result.stderr, tmpdir, metadata["hash"])
+    if report is not None:
+        require_candidate_binary(bin_path, result)
+    return result
 
 
 def _dump_kernel_binary(metadata_hash: str, bin_path: str):
@@ -861,7 +886,9 @@ def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: di
         compile_func = linalg_to_bin_enable_npu_compile_A2_A3
 
     try:
-        compile_func(linalg, metadata, opt)
+        compiled = compile_func(linalg, metadata, opt)
+        if isinstance(compiled, BatchDecline):
+            return False, compiled.reason
         return (True, "")
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
@@ -1074,7 +1101,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += [f"--save-temps={_get_save_temps_dir(metadata['hash'])}"]
 
-        _compile_option_list += _masked_batch_compile_options(metadata, npu_compiler_path)
+        masked_options = _masked_batch_compile_options(metadata, npu_compiler_path)
+        if isinstance(masked_options, BatchDecline):
+            return masked_options
+        _compile_option_list += masked_options
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or knobs.autotuning.print:
@@ -1082,24 +1112,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
-        try:
-            ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
-            layout = metadata.get("block_batching", {}).get("layout", {})
-            applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
-            from .block_batching import LayoutTargetRejected, _layout_resource_refusal, CVTargetRejected, _cv_resource_refusal, _is_cv_report
-            if _is_cv_report(metadata.get("block_batching", {})) and _cv_resource_refusal(e.returncode, diagnostic):
-                raise CVTargetRejected(diagnostic[-16000:]) from e
-            if (opt.block_batching_layout == "auto" and applied and _layout_resource_refusal(e.returncode, diagnostic)):
-                raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
-                                           diagnostic[-16000:]) from e
-            raise
-
-        if opt.debug:
-            _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+        ret = _run_vendor_npubin(cmd_list, env, opt, metadata, tmpdir, bin_path, cv_resources=True)
+        if isinstance(ret, BatchDecline):
+            return ret
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -1121,8 +1136,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if "block_batching" in metadata:
             if _batching_backend_revision(npu_compiler_path) != opt.block_batching_backend_revision:
-                raise BatchingRejected("BACKEND_CHANGED_DURING_COMPILE")
-            validate_compilation_result(metadata)
+                raise BatchCompileError("BACKEND_CHANGED_DURING_COMPILE", stage="npubin")
+            decline = validate_compilation_result(metadata)
+            if decline is not None:
+                return decline
             metadata["block_batching_binary_sha256"] = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
             metadata["block_batching_plan_sha256"] = metadata["block_batching"]["guard"]["plan_fingerprint"]
         return Path(bin_path).read_bytes()
@@ -1303,27 +1320,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
-        try:
-            ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
-            layout = metadata.get("block_batching", {}).get("layout", {})
-            applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
-            crash = e.returncode < 0 or e.returncode in (134, 139) or any(
-                marker in diagnostic for marker in ("PLEASE submit a bug report", "LLVM ERROR:", "Assertion"))
-            resource_refusal = re.search(
-                r"(?:UB|unified buffer)[^\n]*(?:exceed|overflow|insufficient)|"
-                r"(?:insufficient|not enough|failed to allocate)[^\n]*(?:UB|unified buffer)", diagnostic, re.IGNORECASE)
-            if opt.block_batching_layout == "auto" and applied and not crash and resource_refusal:
-                from .block_batching import LayoutTargetRejected
-                raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
-                                           diagnostic[-16000:]) from e
-            raise
-
-        if opt.debug:
-            _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+        ret = _run_vendor_npubin(cmd_list, env, opt, metadata, tmpdir, bin_path, cv_resources=False)
+        if isinstance(ret, BatchDecline):
+            return ret
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -1888,16 +1887,16 @@ class AscendBackend(BaseBackend):
         if not hasattr(src, "block_batching_source_hash"):
             return cache
         if options.block_batching_factor > 1 and (override_enabled or options.ir_override):
-            raise BatchingRejected("IR_OVERRIDE_NOT_SUPPORTED")
+            raise BatchCompileError("unisolated candidate override reached stage writer", stage="config")
         from triton.runtime.cache import FileCacheManager
         if type(cache) is not FileCacheManager:
-            raise BatchingRejected("CUSTOM_CACHE_NOT_SUPPORTED")
+            raise BatchCompileError("custom cache reached frozen source writer", stage="config")
         import uuid
         return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
 
-    def compile_bundle(self, src, options, compile_variant):
+    def compile_bundle(self, src, options, compile_variant, *, env_vars=None):
         from .block_batching import compile_bundle
-        return compile_bundle(self, src, options, compile_variant)
+        return compile_bundle(self, src, options, compile_variant, env_vars=env_vars)
 
     def add_stages(self, stages, options, language):
         if self.target.backend == "npu":

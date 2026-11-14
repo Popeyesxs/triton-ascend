@@ -32,10 +32,11 @@ struct BatchLayoutPlan {
   BatchExprRef coordinate, upper;
   bool controlFlowIndependent = false;
 };
-// An owned outcome, never an IR handle. Layout attempts may downgrade this
-// copy to Keep without changing the accepted source plan.
+// The accepted plan owns its proof. An attempt records only its outcome.
 struct BatchLayoutResult {
-  BatchLayoutPlan layout;
+  unsigned accessID;
+  BatchLayoutPlan::Action action;
+  std::string reason;
   bool rewritten = false;
   std::string runtimeGuardJSON;
 };

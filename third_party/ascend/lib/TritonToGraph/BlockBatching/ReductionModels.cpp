@@ -1,5 +1,6 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/ReductionModels.h"
+#include "TritonToGraph/BlockBatching/BatchAnalyzer.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -30,58 +31,60 @@ bool hasBatchIndependentScanDomain(RankedTensorType source, int64_t axis,
   return true;
 }
 
-LogicalResult verifyBatchAggregationDomains(Operation *root,
-                                            std::string &reason,
-                                            Operation *&failedOp) {
+BatchResult<bool> BatchAnalyzer::analyzeAggregation() {
+  using Result = BatchResult<bool>;
   // A row reduction produces one independent value per surviving row. Track
   // those coordinates through existing shape/elementwise and SCF operations.
   // Collapsing one of them in another reduction needs a multi-axis tile
   // lowering, not the current independent-row lowering contract.
-  struct Domain {
-    llvm::SmallBitVector rows;
-    bool unknown = false;
-  };
-  DenseMap<Value, Domain> domains;
   SmallVector<Value> pending;
   auto shape = [](Value value) -> ArrayRef<int64_t> {
     auto type = dyn_cast<RankedTensorType>(value.getType());
     return type ? type.getShape() : ArrayRef<int64_t>{};
   };
-  auto merge = [&](Value value, Domain incoming) {
-    if (incoming.rows.none() && !incoming.unknown)
-      return;
-    auto &state = domains[value];
-    state.rows.resize(shape(value).size());
-    auto old = state.rows;
-    bool changed = incoming.unknown && !state.unknown;
-    state.unknown |= incoming.unknown;
-    state.rows |= incoming.rows;
-    if (changed || old != state.rows)
+  auto merge = [&](Value value, const llvm::SmallBitVector &rows,
+                   bool unknown) {
+    if (workspace.mergeRows(value, rows, unknown))
       pending.push_back(value);
   };
-  root->walk([&](triton::ReduceOp reduce) {
+  auto inconsistent = [] {
+    return Result::error(
+        {"INVALID_BATCH_AGGREGATION_STATE", "aggregation", {}, {}, {}, {}});
+  };
+  auto seeds = function->walk([&](triton::ReduceOp reduce) {
+    if (reduce.getNumOperands() == 0)
+      return WalkResult::interrupt();
     auto source = shape(reduce.getOperand(0));
     int64_t axis = reduce.getAxis();
+    if (axis < 0 || static_cast<size_t>(axis) >= source.size())
+      return WalkResult::interrupt();
     if (source[axis] == 1)
-      return;
+      return WalkResult::advance();
     for (Value output : reduce.getResults()) {
-      Domain domain{llvm::SmallBitVector(shape(output).size()), false};
+      llvm::SmallBitVector rows(shape(output).size());
       for (auto [dim, extent] : llvm::enumerate(shape(output)))
         if (extent != 1)
-          domain.rows.set(dim);
-      merge(output, std::move(domain));
+          rows.set(dim);
+      merge(output, rows, false);
     }
+    return WalkResult::advance();
   });
+  if (seeds.wasInterrupted())
+    return inconsistent();
   unsigned budget = 65536;
   while (!pending.empty()) {
     Value value = pending.pop_back_val();
-    Domain input = domains.lookup(value);
+    auto domain = workspace.aggregation(value);
+    if (!domain || domain->first.size() != shape(value).size())
+      return inconsistent();
+    const auto &inputRows = domain->first;
+    const bool inputUnknown = domain->second;
     for (OpOperand &use : value.getUses()) {
       Operation *op = use.getOwner();
       auto reject = [&](StringRef why) {
         reason = why.str();
-        failedOp = op;
-        return failure();
+        operation = op;
+        return Result::decline({reason, "aggregation", {}, {}, {}, {}});
       };
       if (!budget--)
         return reject("VV_AGGREGATION_ANALYSIS_BUDGET_EXCEEDED");
@@ -89,8 +92,11 @@ LogicalResult verifyBatchAggregationDomains(Operation *root,
         // Only iter_args carry tensors; bounds are scalar loop analysis facts.
         if (use.getOperandNumber() >= 3) {
           unsigned index = use.getOperandNumber() - 3;
-          merge(loop.getRegionIterArgs()[index], input);
-          merge(loop.getResult(index), input);
+          if (index >= loop.getRegionIterArgs().size() ||
+              index >= loop.getNumResults())
+            return inconsistent();
+          merge(loop.getRegionIterArgs()[index], inputRows, inputUnknown);
+          merge(loop.getResult(index), inputRows, inputUnknown);
         }
         continue;
       }
@@ -98,25 +104,33 @@ LogicalResult verifyBatchAggregationDomains(Operation *root,
         Operation *parent = yield->getParentOp();
         unsigned index = use.getOperandNumber();
         if (auto loop = dyn_cast<scf::ForOp>(parent)) {
-          merge(loop.getRegionIterArgs()[index], input);
-          merge(loop.getResult(index), input);
+          if (index >= loop.getRegionIterArgs().size() ||
+              index >= loop.getNumResults())
+            return inconsistent();
+          merge(loop.getRegionIterArgs()[index], inputRows, inputUnknown);
+          merge(loop.getResult(index), inputRows, inputUnknown);
         } else if (auto branch = dyn_cast<scf::IfOp>(parent)) {
-          merge(branch.getResult(index), input);
+          if (index >= branch.getNumResults())
+            return inconsistent();
+          merge(branch.getResult(index), inputRows, inputUnknown);
         }
         continue;
       }
       if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
         unsigned axis = reduce.getAxis();
-        if (input.unknown)
+        if (inputUnknown)
           return reject("VV_AGGREGATION_DOMAIN_NOT_PROVEN");
-        if (input.rows.test(axis) && shape(value)[axis] != 1)
+        if (axis >= inputRows.size())
+          return inconsistent();
+        if (inputRows.test(axis) && shape(value)[axis] != 1)
           return reject("VV_MULTI_AXIS_REDUCTION_NOT_SUPPORTED");
-        Domain output{llvm::SmallBitVector(input.rows.size() - 1), false};
-        for (unsigned dim = 0, target = 0; dim < input.rows.size(); ++dim)
+        llvm::SmallBitVector outputRows(inputRows.size() - 1);
+        bool outputUnknown = false;
+        for (unsigned dim = 0, target = 0; dim < inputRows.size(); ++dim)
           if (dim != axis)
-            output.rows[target++] = input.rows[dim];
+            outputRows[target++] = inputRows[dim];
         for (Value result : reduce.getResults())
-          merge(result, output);
+          merge(result, outputRows, outputUnknown);
         continue;
       }
       // Memory observations and writes terminate compute-value provenance.
@@ -125,13 +139,23 @@ LogicalResult verifyBatchAggregationDomains(Operation *root,
       const auto *model = lookupBatchOp(op->getName().getStringRef());
       for (Value result : op->getResults()) {
         auto target = shape(result);
-        Domain output{llvm::SmallBitVector(target.size()), input.unknown};
+        llvm::SmallBitVector outputRows(target.size());
+        bool outputUnknown = inputUnknown;
         if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-          for (unsigned dim = 0; dim < input.rows.size(); ++dim)
-            output.rows[dim + (dim >= expand.getAxis())] = input.rows[dim];
+          if (outputRows.size() != inputRows.size() + 1 ||
+              static_cast<size_t>(expand.getAxis()) > inputRows.size())
+            return inconsistent();
+          for (unsigned dim = 0; dim < inputRows.size(); ++dim)
+            outputRows[dim + (dim >= expand.getAxis())] = inputRows[dim];
         } else if (auto trans = dyn_cast<triton::TransOp>(op)) {
+          auto order = trans.getOrder();
+          if (order.size() != target.size() ||
+              llvm::any_of(order, [&](int dim) {
+                return static_cast<size_t>(dim) >= inputRows.size();
+              }))
+            return inconsistent();
           for (unsigned dim = 0; dim < target.size(); ++dim)
-            output.rows[dim] = input.rows[trans.getOrder()[dim]];
+            outputRows[dim] = inputRows[order[dim]];
         } else if (isa<triton::ReshapeOp>(op)) {
           // Singleton-only reshapes preserve effective coordinates. General
           // flattening/splitting requires a separate coordinate proof.
@@ -147,23 +171,23 @@ LogicalResult verifyBatchAggregationDomains(Operation *root,
             same = shape(value)[from[i]] == target[to[i]];
           if (same) {
             for (unsigned i = 0; i < from.size(); ++i)
-              output.rows[to[i]] = input.rows[from[i]];
+              outputRows[to[i]] = inputRows[from[i]];
           } else {
-            output.unknown = true;
+            outputUnknown = true;
           }
-        } else if (target.size() == input.rows.size() &&
+        } else if (target.size() == inputRows.size() &&
                    (isa<triton::BroadcastOp>(op) ||
                     (model && (model->model == BatchModel::Elementwise ||
                                model->model == BatchModel::IndexCast)))) {
-          output.rows = input.rows;
+          outputRows = inputRows;
         } else {
-          output.unknown = true;
+          outputUnknown = true;
         }
-        merge(result, std::move(output));
+        merge(result, outputRows, outputUnknown);
       }
     }
   }
-  return success();
+  return Result::success(true);
 }
 
 unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {

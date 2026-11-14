@@ -11,43 +11,34 @@ pytestmark = pytest.mark.backend('native')
 
 
 @pytest.mark.parametrize('rank', [0, 1, 4, 8, 19])
-def test_affine_arithmetic_preserves_concrete_types_and_dimensions(rank):
-    nd = importlib.import_module(PACKAGE + '.block_batching_guard_v2').AffineND
+def test_affine_arithmetic_preserves_values_and_dimensions(rank):
+    cls = guard_module.Affine
     rng = random.Random(9741 + rank)
-    for cls in [guard_module.Affine, nd]:
-        for _ in range(100):
-            a, b = (cls(rng.randrange(-2**63, 2**63), tuple(rng.randrange(-8, 9)
-                                                            for _ in range(rank)))
-                    for _ in range(2))
-            for sign in [-1, 1]:
-                c = a.add(b, sign=sign)
-                assert type(c) is cls
-                assert c.offset == a.offset + sign * b.offset
-                assert c.coefficients == tuple(x + sign * y for x, y in zip(a.coefficients, b.coefficients))
-            scaled = a.scale(-3)
-            assert type(scaled) is cls and scaled.offset == -3 * a.offset
-            assert scaled.coefficients == tuple(-3 * x for x in a.coefficients)
-            assert a.uniform == all(x == 0 for x in a.coefficients)
-    assert guard_module.Affine(3).coefficients == (0, 0, 0, 0)
-    with pytest.raises(TypeError):
-        nd(3)
+    for _ in range(100):
+        a, b = (cls(rng.randrange(-2**63, 2**63), tuple(rng.randrange(-8, 9) for _ in range(rank))) for _ in range(2))
+        for sign in [-1, 1]:
+            assert a.add(b, sign=sign) == cls(a.offset + sign * b.offset,
+                                              tuple(x + sign * y for x, y in zip(a.coefficients, b.coefficients)))
+        scaled = a.scale(scale=-3)
+        assert scaled.offset == -3 * a.offset
+        assert scaled.coefficients == tuple(-3 * x for x in a.coefficients)
+        assert a.uniform == all(x == 0 for x in a.coefficients)
+        counts = tuple(rng.randrange(1, 8) for _ in range(rank))
+        deltas = [k * (n - 1) for k, n in zip(a.coefficients, counts)]
+        assert a.bounds(counts) == (a.offset + sum(min(0, v)
+                                                   for v in deltas), a.offset + sum(max(0, v) for v in deltas))
+    assert cls(3).coefficients == (0, 0, 0, 0)
     with pytest.raises(FrozenInstanceError):
         a.offset = 0
 
 
-def test_affine_keeps_legacy_keyword_and_subclass_result_contract():
-    nd = importlib.import_module(PACKAGE + '.block_batching_guard_v2').AffineND
+def test_affine_keeps_zip_truncation_and_concrete_result_type():
 
-    class Legacy(guard_module.Affine):
+    class Derived(guard_module.Affine):
         pass
 
-    class Multiaxis(nd):
-        pass
-
-    assert type(Legacy(2).scale(scale=3)) is guard_module.Affine
-    assert type(Multiaxis(2, (1, )).scale(value=3)) is nd
-    # Refactoring must not add dimension validation or change zip truncation.
-    assert Legacy(1, (1, 2)).add(nd(2, (3, ))).coefficients == (4, )
+    assert type(Derived(2).scale(scale=3)) is guard_module.Affine
+    assert Derived(1, (1, 2)).add(guard_module.Affine(2, (3, ))).coefficients == (4, )
 
 
 @pytest.mark.parametrize('grid,cv,preserve,capture,floor,expected,queries', [
@@ -196,7 +187,12 @@ def test_candidate_execution_error_is_not_replayed_on_baseline(bundle_environmen
     assert env.wrapper.last_launch['runtime_status'] == 'NOT_LAUNCHED'
 
 
-def test_owned_effect_codec_without_mlir_under_ubsan(tmp_path):
+@pytest.mark.parametrize('test_name,implementations', [
+    ('EffectProjectionTest', ['BatchExpr.cpp', 'BatchFactsJSON.cpp']),
+    ('AffineProfilesTest',
+     ['BatchExpr.cpp', 'BatchAffine.cpp', 'BatchRangeAnalysis.cpp', 'BatchLoopSchedule.cpp', 'BatchLoopLegality.cpp']),
+])
+def test_checked_batching_values_under_ubsan(tmp_path, test_name, implementations):
     import os
     from pathlib import Path
     import re
@@ -218,9 +214,9 @@ def test_owned_effect_codec_without_mlir_under_ubsan(tmp_path):
         pytest.skip('owned-fact UBSan test needs a C++ compiler and LLVM development installation')
     include = subprocess.check_output([llvm, '--includedir'], text=True).strip()
     libs = shlex.split(subprocess.check_output([llvm, '--ldflags', '--libs', 'support', '--system-libs'], text=True))
-    sources = [root / 'unittest/BlockBatching/EffectProjectionTest.cpp']
-    sources += [root / 'lib/TritonToGraph/BlockBatching' / name for name in ['BatchExpr.cpp', 'BatchFactsJSON.cpp']]
-    exe = tmp_path / 'effect_projection'
+    sources = [root / 'unittest/BlockBatching' / (test_name + '.cpp')]
+    sources += [root / 'lib/TritonToGraph/BlockBatching' / name for name in implementations]
+    exe = tmp_path / test_name
     command = [
         compiler, '-std=c++17', '-O1', '-g', '-fsanitize=undefined', '-fno-sanitize-recover=all',
         '-I' + str(root / 'include'), '-I' + include, *map(str, sources), *libs, '-o',
@@ -232,5 +228,27 @@ def test_owned_effect_codec_without_mlir_under_ubsan(tmp_path):
         command.insert(1, '-fno-rtti')
     subprocess.run(command, capture_output=True, text=True, check=True)
     result = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
-    assert 'owned effect projection regressions passed' in result.stdout
+    if test_name == 'EffectProjectionTest':
+        assert 'owned effect projection regressions passed' in result.stdout
     assert not result.stderr
+
+
+def test_cv_binding_reads_live_mode_and_an_initially_bound_empty_report(bundle_environment):
+    env = bundle_environment
+    env.report['cv_mode'] = 'independent_batch_v1'
+    wrapper = batching.BatchKernel(env.base, env.candidate, batching.BatchRequest(3, 0), env.report, [0, 1, 2, 3])
+    wrapper._dispatch(5, *env.launch[1:])
+    assert wrapper.last_launch['reason'] == 'CV_GRID_NOT_DIVISIBLE'
+    env.report['cv_mode'] = 'disabled'
+    wrapper._dispatch(5, *env.launch[1:])
+    assert wrapper.last_launch['runtime_status'] == 'APPLIED'
+    env.report.clear()
+    with pytest.raises(KeyError, match='selected_axis'):
+        wrapper._dispatch(5, *env.launch[1:])
+
+
+def test_element_span_reports_negative_stride_before_reading_missing_write_policy():
+    domain = guard_module.Domain([], (2, 1, 1))
+    access = {'offset': ['muli', 64, ['pid', 0, 32], ['const', -1, 64]], 'mask': None}
+    with pytest.raises(guard_module.GuardFailure, match='NEGATIVE_STRIDE'):
+        domain.access(access)

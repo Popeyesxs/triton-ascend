@@ -180,8 +180,10 @@ LogicalResult finalizeVvComputation(Operation *root, std::string &description,
   return success();
 }
 
-void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
-                        llvm::StringRef reason) {
+BatchDiagnostic snapshotBatchDiagnostic(Operation *op, llvm::StringRef stage,
+                                        llvm::StringRef reason) {
+  BatchDiagnostic report;
+  report.stage = stage.str();
   report.reason = reason.str();
   report.operation = op->getName().getStringRef().str();
   report.context = "BlockBody";
@@ -208,8 +210,24 @@ void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
     }
   }
   report.location.clear();
-  llvm::raw_string_ostream stream(report.location);
-  op->getLoc().print(stream);
+  {
+    llvm::raw_string_ostream stream(report.location);
+    op->getLoc().print(stream);
+  }
+  return report;
+}
+
+void applyBatchDiagnostic(BatchAnalysisReport &report,
+                          const BatchDiagnostic &detail) {
+  report.reason = detail.reason;
+  report.operation = detail.operation;
+  report.context = detail.context;
+  report.location = detail.location;
+}
+
+void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
+                        llvm::StringRef reason) {
+  applyBatchDiagnostic(report, snapshotBatchDiagnostic(op, "analysis", reason));
 }
 
 FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,

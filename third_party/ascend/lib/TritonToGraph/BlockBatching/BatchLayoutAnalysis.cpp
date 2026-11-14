@@ -13,158 +13,8 @@ namespace mlir::triton::cfg {
 namespace {
 using E = BatchExprRef;
 using K = BatchExpr;
-using Key = std::pair<K::Kind, int64_t>;
-// The exact integer affine decomposition now lives in BatchAffine.h, shared
-// with the loop judgment layer. This file keeps its historical leaf set
-// (kBatchLayoutLeaves): induction variables still fail the decomposition here,
-// so a loop-dependent bound still falls through to KEEP exactly as before.
-
-// Parameter-affine addresses: coordinates vary inside the batch; scalar
-// arguments/grid extents are uniform parameters of their coefficients. Keep
-// scalar algebra bounded to affine parameter expressions (no parameter products
-// or solver). This proves (p*M+r)*S structurally without specializing S.
-struct Scalar {
-  using Atom = std::tuple<K::Kind, int64_t, unsigned>;
-  int64_t constant = 0;
-  std::map<Atom, int64_t> parameters;
-  bool isZero() const { return constant == 0 && parameters.empty(); }
-  bool operator==(const Scalar &other) const {
-    return constant == other.constant && parameters == other.parameters;
-  }
-  bool addScaled(const Scalar &other, int64_t scale) {
-    int64_t value;
-    if (llvm::MulOverflow(other.constant, scale, value) ||
-        llvm::AddOverflow(constant, value, constant))
-      return false;
-    for (auto [atom, coefficient] : other.parameters) {
-      if (llvm::MulOverflow(coefficient, scale, value) ||
-          llvm::AddOverflow(parameters[atom], value, parameters[atom]))
-        return false;
-      if (!parameters[atom])
-        parameters.erase(atom);
-    }
-    return parameters.size() <= 32;
-  }
-  std::optional<Scalar> multiply(const Scalar &other) const {
-    if (!parameters.empty() && !other.parameters.empty())
-      return std::nullopt;
-    Scalar result;
-    bool ok = parameters.empty() ? result.addScaled(other, constant)
-                                 : result.addScaled(*this, other.constant);
-    return ok ? std::optional<Scalar>(result) : std::nullopt;
-  }
-  std::optional<Scalar> divide(int64_t divisor) const {
-    if (constant % divisor)
-      return std::nullopt;
-    Scalar result{constant / divisor, {}};
-    for (auto [atom, coefficient] : parameters) {
-      if (coefficient % divisor)
-        return std::nullopt;
-      result.parameters[atom] = coefficient / divisor;
-    }
-    return result;
-  }
-  E expression() const {
-    E result = K::leaf(K::Constant, constant, 64);
-    for (auto [atom, coefficient] : parameters) {
-      auto [kind, id, bits] = atom;
-      E term = K::leaf(kind, id, bits);
-      if (bits != 64)
-        term = K::node(K::ExtSI, 64, term, {}, bits);
-      if (coefficient != 1)
-        term = K::node(K::Mul, 64, term, K::leaf(K::Constant, coefficient, 64));
-      if (result->kind == K::Constant && result->value == 0)
-        result = term;
-      else
-        result = K::node(K::Add, 64, result, term);
-    }
-    return result;
-  }
-};
-using LayoutKey = std::tuple<K::Kind, int64_t, int64_t>;
-struct ParameterAffine {
-  Scalar offset;
-  std::map<LayoutKey, Scalar> terms;
-  bool symbolic() const {
-    return !offset.parameters.empty() ||
-           llvm::any_of(terms, [](const auto &term) {
-             return !term.second.parameters.empty();
-           });
-  }
-};
-std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget,
-                                               int axis) {
-  if (!e || !budget)
-    return std::nullopt;
-  --budget;
-  if (e->kind == K::Constant)
-    return ParameterAffine{Scalar{e->value, {}}, {}};
-  if (e->kind == K::Argument) {
-    if (e->bits != 32 && e->bits != 64)
-      return std::nullopt;
-    Scalar value;
-    value.parameters[{e->kind, e->value, e->bits}] = 1;
-    return ParameterAffine{value, {}};
-  }
-  // Induction 在这里和坐标同级：normalizeBatchAccessOnLogicalAxis 已经把循环
-  // 变量换成「下界 + 圈内偏移」，剩下的这个叶子代表圈内偏移，各份相同。
-  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid ||
-      e->kind == K::Induction) {
-    ParameterAffine value;
-    value.terms[{e->kind, e->value, 0}] = Scalar{1, {}};
-    return value;
-  }
-  // Quotient/remainder of another program axis is uniform within this
-  // batch. Preserve its divisor and existing proof rather than treating it
-  // as a linear function of the selected axis.
-  if (e->kind == K::ProgramQuotient || e->kind == K::ProgramRemainder) {
-    if (e->value == axis || e->extent <= 0)
-      return std::nullopt;
-    ParameterAffine value;
-    value.terms[{e->kind, e->value, e->extent}] = Scalar{1, {}};
-    return value;
-  }
-  if (e->kind == K::ExtSI)
-    return parameterAffine(e->lhs, budget, axis);
-  if (e->kind != K::Add && e->kind != K::Sub && e->kind != K::Mul)
-    return std::nullopt;
-  auto a = parameterAffine(e->lhs, budget, axis);
-  auto b = parameterAffine(e->rhs, budget, axis);
-  if (!a || !b)
-    return std::nullopt;
-  if (e->kind == K::Mul) {
-    if (!a->terms.empty() && !b->terms.empty())
-      return std::nullopt;
-    if (b->terms.empty())
-      std::swap(a, b);
-    auto offset = b->offset.multiply(a->offset);
-    if (!offset)
-      return std::nullopt;
-    b->offset = *offset;
-    for (auto &[key, coefficient] : b->terms) {
-      auto product = coefficient.multiply(a->offset);
-      if (!product)
-        return std::nullopt;
-      coefficient = *product;
-    }
-    for (auto it = b->terms.begin(); it != b->terms.end();)
-      if (it->second.isZero())
-        it = b->terms.erase(it);
-      else
-        ++it;
-    return b;
-  }
-  int64_t sign = e->kind == K::Sub ? -1 : 1;
-  if (!a->offset.addScaled(b->offset, sign))
-    return std::nullopt;
-  for (const auto &[key, coefficient] : b->terms) {
-    if (!a->terms[key].addScaled(coefficient, sign))
-      return std::nullopt;
-    if (a->terms[key].isZero())
-      a->terms.erase(key);
-  }
-  return a->terms.size() <= 32 ? a : std::nullopt;
-}
+using Key = BatchAffineForm::Key;
+using Coefficient = BatchAffineForm::Coefficient;
 bool contains(E e, K::Kind kind, int64_t id = -1) {
   if (!e)
     return false;
@@ -190,12 +40,14 @@ bool redundantNonnegativeBound(E predicate) {
       predicate->lhs->kind != K::Constant || predicate->lhs->value != -1)
     return false;
   unsigned budget = 256;
-  auto form = batchLinearForm(predicate->rhs, budget,
-                              batchLeaf(K::Program) | batchLeaf(K::Coordinate) |
-                                  batchLeaf(K::Grid));
-  return form && form->constant >= 0 &&
-         llvm::all_of(form->terms,
-                      [](const auto &term) { return term.second >= 0; });
+  auto form = BatchAffineForm::fromExpr(
+      predicate->rhs, budget,
+      batchLeaf(K::Program) | batchLeaf(K::Coordinate) | batchLeaf(K::Grid),
+      BatchAffineForm::Profile::Integer, -1);
+  return form && form->offset.constant >= 0 &&
+         llvm::all_of(form->terms, [](const auto &term) {
+           return term.second.constant >= 0;
+         });
 }
 void coordinateIDs(E e, SmallVectorImpl<int64_t> &ids) {
   if (!e)
@@ -222,25 +74,28 @@ bool rangeGroup(E e, ArrayRef<int64_t> axes) {
 // local projections with the selected program direction. It excludes all
 // other program directions, even if their strides happen to be equal.
 // 名字不叫 bind：实参里有 std::shared_ptr，ADL 会把 std::bind 拉进候选集。
-bool bindProgramDirection(E predicate, const BatchAccessFact &fact,
+bool bindProgramDirection(E predicate, const BatchFacts::Access &fact,
                           BatchLayoutPlan &plan) {
   if (predicate->kind != K::SLT || contains(predicate->rhs, K::Coordinate) ||
       contains(predicate->rhs, K::Program))
     return false;
   unsigned budget = 256;
-  auto form = batchLinearForm(predicate->lhs, budget, kBatchLoopLeaves);
+  auto form =
+      BatchAffineForm::fromExpr(predicate->lhs, budget, kBatchLoopLeaves,
+                                BatchAffineForm::Profile::Integer, -1);
   if (!form)
     return false;
   SmallVector<int64_t> axes;
-  for (auto [key, value] : form->terms) {
+  for (const auto &[key, coefficient] : form->terms) {
+    int64_t value = coefficient.constant;
     if (!value)
       continue;
-    if (key.first == K::Coordinate && value > 0)
-      axes.push_back(key.second);
+    if (std::get<0>(key) == K::Coordinate && value > 0)
+      axes.push_back(std::get<1>(key));
     // 圈内偏移对整块是一个各份相同的平移，不参与方向绑定，放行但不记轴。
-    else if (key.first == K::Induction)
+    else if (std::get<0>(key) == K::Induction)
       continue;
-    else if (key != Key{K::Program, plan.gridAxis})
+    else if (key != Key{K::Program, plan.gridAxis, 0})
       return false;
   }
   if (axes.empty())
@@ -248,33 +103,35 @@ bool bindProgramDirection(E predicate, const BatchAccessFact &fact,
   int64_t extent = 1;
   for (int64_t axis : llvm::reverse(axes)) {
     if (axis < 0 || axis >= static_cast<int64_t>(fact.shape.size()) ||
-        form->terms[{K::Coordinate, axis}] != extent || fact.shape[axis] <= 0 ||
+        form->terms[{K::Coordinate, axis, 0}].constant != extent ||
+        fact.shape[axis] <= 0 ||
         llvm::MulOverflow(extent, fact.shape[axis], extent))
       return false;
   }
-  if (form->terms[{K::Program, plan.gridAxis}] != extent)
+  if (form->terms[{K::Program, plan.gridAxis, 0}].constant != extent)
     return false;
   plan.localAxes = axes;
   plan.tileExtent = extent;
-  plan.origin = form->constant;
+  plan.origin = form->offset.constant;
   plan.coordinate = predicate->lhs;
   plan.upper = predicate->rhs;
   return true;
 }
 } // namespace
 SmallVector<BatchLayoutPlan, 0>
-planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
+planBatchLayouts(const BatchRewriteWorkspace &scope, int axis, int64_t factor) {
   SmallVector<BatchLayoutPlan, 0> plans;
-  for (auto [id, originalFact] : llvm::enumerate(accesses.accesses)) {
+  for (auto [id, originalFact] : llvm::enumerate(scope.facts->accesses())) {
     // 把循环变量接回程序号，再往下全程用归一后的这一份。不接的话，一条按行走
     // 的访存地址里只有归纳变量、没有 K::Program，下面第一个分支就会判它
     // SHARED_ACCESS——字面正确但结论错，程序号只是藏在循环下界里。
     //
     // 地址与掩码必须一起换、而且只换一次：下面要拿 plan.coordinate 和谓词做
     // 指针相等比较，两边来源不同就对不上。
-    BatchAccessFact fact = originalFact;
+    BatchFacts::Access fact = originalFact;
     bool normalized = true;
-    for (const BatchLoopFact &loop : originalFact.loops) {
+    for (unsigned id : originalFact.loopIDs) {
+      const auto &loop = *scope.facts->findLoop(id);
       fact.byteOffset =
           normalizeBatchAccessOnLogicalAxis(fact.byteOffset, loop);
       fact.mask = normalizeBatchAccessOnLogicalAxis(fact.mask, loop);
@@ -287,12 +144,12 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     // Reuse the access proof: nested execution, device-derived addresses and
     // unknown expressions do not establish control-flow-independent memory.
     plan.controlFlowIndependent =
-        isa<triton::FuncOp>(accesses.sources.accesses[id]->getParentOp()) &&
+        isa<triton::FuncOp>(scope.sourceAccesses()[id]->getParentOp()) &&
         !fact.deviceAddress && fact.byteOffset &&
         !contains(fact.byteOffset, K::Unknown) &&
         !contains(fact.mask, K::Unknown);
     llvm::raw_string_ostream stream(plan.location);
-    accesses.sources.accesses[id]->getLoc().print(stream);
+    scope.sourceAccesses()[id]->getLoc().print(stream);
     if (!normalized) {
       // 归一不下去就按证不出处理，绝不退回原式：那等于把"程序号不在地址里"这个
       // 错误结论静默放行。
@@ -324,23 +181,27 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     } else if (bound && !unknown) {
       // Direction is established above. Check the byte-stride chain only now.
       unsigned budget = 512;
-      auto address = parameterAffine(fact.byteOffset, budget, axis);
+      auto address = BatchAffineForm::fromExpr(
+          fact.byteOffset, budget,
+          kBatchLoopLeaves | batchLeaf(K::ProgramQuotient) |
+              batchLeaf(K::ProgramRemainder),
+          BatchAffineForm::Profile::Parameter, axis);
       bool strides = bool(address);
       if (address) {
         int64_t weight = 1;
-        Scalar stride =
+        Coefficient stride =
             address->terms[{K::Coordinate, plan.localAxes.back(), 0}];
         // Positive dynamic stride is checked at launch, never sampled here.
         strides = !stride.parameters.empty() || stride.constant > 0;
         for (int64_t local : llvm::reverse(plan.localAxes)) {
-          auto expected = stride.multiply(Scalar{weight, {}});
+          auto expected = stride.multiply(Coefficient{weight, {}});
           if (!expected ||
               !(address->terms[{K::Coordinate, local, 0}] == *expected))
             strides = false;
           if (llvm::MulOverflow(weight, fact.shape[local], weight))
             strides = false;
         }
-        auto expected = stride.multiply(Scalar{weight, {}});
+        auto expected = stride.multiply(Coefficient{weight, {}});
         if (!expected || !(address->terms[{K::Program, axis, 0}] == *expected))
           strides = false;
       }
@@ -380,13 +241,13 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         // Preserve that uniform row origin just as for [1, N] tiles; the
         // closed-region verifier below the planner proves the computation.
         bool rowVector =
-            fact.shape.size() == 1 && fact.loops.empty() &&
+            fact.shape.size() == 1 && fact.loopIDs.empty() &&
             plan.localAxes == SmallVector<int64_t>{0} &&
             llvm::any_of(address->terms, [&](const auto &term) {
               auto [kind, id, divisor] = term.first;
               return kind == K::Program && id != axis && !term.second.isZero();
             });
-        // 这里原本还带一条 fact.loops.empty()。它挡住的不只是程序轴循环——块内
+        // 这里原本还带一条 fact.loopIDs.empty()。它挡住的不只是程序轴循环——块内
         // 循环今天就放行，这类访存一路证得出
         // PROVEN_DIRECTION_AND_STRIDE_CHAIN， 却因为这一条而 linearMemoryView
         // 为假，于是 BatchMemoryView.cpp:451
@@ -433,7 +294,7 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
           auto [kind, id, divisor] = key;
           bool uniformDivision =
               kind == K::ProgramQuotient || kind == K::ProgramRemainder;
-          if (coefficient.isZero() || key == LayoutKey{K::Program, axis, 0} ||
+          if (coefficient.isZero() || key == Key{K::Program, axis, 0} ||
               (kind == K::Coordinate && llvm::is_contained(plan.localAxes, id)))
             continue;
           auto scaled = coefficient.divide(fact.bytes);
@@ -488,16 +349,16 @@ SmallVector<BatchLayoutResult, 0>
 initialBatchLayoutResults(ArrayRef<BatchLayoutPlan> plans) {
   SmallVector<BatchLayoutResult, 0> results;
   for (const auto &plan : plans)
-    results.push_back({plan, false, {}});
+    results.push_back({plan.accessID, plan.action, plan.reason, false, {}});
   return results;
 }
 std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
-  return serializeBatchLayoutResults(initialBatchLayoutResults(plans));
+  return serializeBatchLayoutResults(plans, initialBatchLayoutResults(plans));
 }
-std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutResult> results) {
+std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutPlan> plans,
+                                        ArrayRef<BatchLayoutResult> results) {
   llvm::json::Array rows;
-  for (const auto &result : results) {
-    const auto &plan = result.layout;
+  for (auto [plan, result] : llvm::zip_equal(plans, results)) {
     llvm::json::Array axes, shape, effectiveShape;
     for (auto axis : plan.localAxes)
       axes.push_back(axis);
@@ -508,8 +369,8 @@ std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutResult> results) {
     }
     rows.push_back(llvm::json::Object{
         {"access_id", plan.accessID},
-        {"action", plan.action == BatchLayoutPlan::Keep ? "Keep"
-                   : plan.action == BatchLayoutPlan::MemoryView
+        {"action", result.action == BatchLayoutPlan::Keep ? "Keep"
+                   : result.action == BatchLayoutPlan::MemoryView
                        ? "MemoryView"
                        : "PointwiseRegion"},
         {"selected_grid_axis", plan.gridAxis},
@@ -519,12 +380,12 @@ std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutResult> results) {
         {"control_flow_independent", plan.controlFlowIndependent},
         {"tile_extent", plan.tileExtent},
         {"origin", plan.origin},
-        {"reason", plan.reason},
+        {"reason", result.reason},
         {"mask_class", plan.maskClass},
         {"source_location", plan.location},
         {"rewritten", result.rewritten},
         {"bridge", !result.rewritten ? "not_applied"
-                   : plan.action == BatchLayoutPlan::PointwiseRegion
+                   : result.action == BatchLayoutPlan::PointwiseRegion
                        ? "direct_pointwise"
                        : "ordered_view"},
         {"expected_memory_form",
