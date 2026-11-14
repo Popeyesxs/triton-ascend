@@ -8,6 +8,9 @@
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
 #include "TritonToGraph/BlockBatching/BatchPlan.h"
 #include "TritonToGraph/BlockBatching/BatchRangeAnalysis.h"
+#include "TritonToGraph/BlockBatching/BatchRequest.h"
+#include "TritonToGraph/BlockBatching/BatchRewriteFinalizer.h"
+#include "TritonToGraph/BlockBatching/BatchRewriteWorkspace.h"
 #include "TritonToGraph/BlockBatching/BatchValueMapping.h"
 #include "TritonToGraph/BlockBatching/CVSpatial.h"
 #include "TritonToGraph/BlockBatching/ControlFlowModels.h"
@@ -538,7 +541,7 @@ cvMaskContract(ArrayRef<Operation *> originals,
     return std::nullopt;
   llvm::DenseMap<Operation *, unsigned> ids;
   for (auto [id, fact] : llvm::enumerate(access.accesses))
-    ids[fact.operation] = id;
+    ids[access.sources.accesses[id]] = id;
   A inputs, outputs;
   for (unsigned operand = 0; operand < 2; ++operand) {
     Value value = dot->getOperand(operand);
@@ -572,7 +575,7 @@ cvMaskContract(ArrayRef<Operation *> originals,
   for (auto [id, fact] : llvm::enumerate(access.accesses)) {
     if (!fact.write)
       continue;
-    auto store = dyn_cast<triton::StoreOp>(fact.operation);
+    auto store = dyn_cast<triton::StoreOp>(access.sources.accesses[id]);
     if (!store)
       return std::nullopt;
     outputs.push_back(static_cast<int64_t>(id));
@@ -683,9 +686,139 @@ SmallVector<int64_t, 3> staticGridExtents(ModuleOp module) {
 }
 } // namespace
 
-static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
-                                                 BatchRequest request,
-                                                 bool fuseControlFlow = false) {
+// Shared source analysis, with exactly the existing CV/VV effect rules.
+// The returned obligations own no IR and perform no serialization or rewrite.
+static FailureOr<BatchProofObligations>
+planBatchMemoryEffects(Block &block, const BatchAccessReport &access,
+                       const BatchControlFlowPlan &control,
+                       Operation *&diagnosticOp) {
+  BatchProofObligations proof;
+  for (auto [id, fact] : llvm::enumerate(access.accesses)) {
+    BatchEffectRule rule =
+        fact.deviceAddress ? BatchEffectRule::ReplicateEffect
+        : fact.isVolatile  ? BatchEffectRule::PreserveVolatile
+        : !fact.write &&
+                !control.isVarying(access.sources.accesses[id]->getResult(0))
+            ? BatchEffectRule::ShareInvariantLoad
+        : fact.write ? BatchEffectRule::SupportedEffect
+                     : BatchEffectRule::ReplicateEffect;
+    bool byteDomain =
+        fact.write || fact.isVolatile || fact.normalizedPointer ||
+        !control.isVarying(access.sources.accesses[id]->getResult(0));
+    proof.effects.push_back({static_cast<unsigned>(id), rule,
+                             byteDomain
+                                 ? BatchEffectProof::ByteDomain
+                                 : BatchEffectProof::LaneCorrespondence});
+  }
+  // Known intervals retain the runtime disjointness proof. An opaque read
+  // needs no host range when its only observable write is a terminal store
+  // whose value consumes that read. Independent outputs, volatile effects,
+  // region-local reads and writes preceding a read require a stronger proof.
+  SmallVector<triton::StoreOp> writes;
+  bool hasVolatile = false;
+  for (auto [id, fact] : llvm::enumerate(access.accesses)) {
+    if (fact.write)
+      writes.push_back(cast<triton::StoreOp>(access.sources.accesses[id]));
+    hasVolatile |= fact.isVolatile;
+  }
+  if (!writes.empty())
+    for (auto [id, fact] : llvm::enumerate(access.accesses))
+      if (fact.deviceAddress) {
+        diagnosticOp = access.sources.accesses[id];
+        auto read = cast<triton::LoadOp>(access.sources.accesses[id]);
+        if (writes.size() != 1 || hasVolatile || read->getBlock() != &block ||
+            writes.front()->getBlock() != &block ||
+            !read->isBeforeInBlock(writes.front().getOperation()) ||
+            !hasPureDataDependency(writes.front().getValue(), read.getResult()))
+          return failure();
+        proof.terminalReads.push_back(id);
+      }
+  return proof;
+}
+
+// Publishing is separate from rewriting: no unverified intermediate report
+// can supply an executable guard. All strategies use this one codec sink.
+static LogicalResult
+publishBatchAppliedRewrite(ModuleOp module,
+                           const std::optional<BatchAppliedRewrite> &applied,
+                           BatchRewriteReport &report) {
+  if (!applied)
+    return failure();
+  auto spec = BatchGuardSpec::fromApplied(*applied);
+  auto encoded = spec ? encodeBatchGuard(*spec) : std::nullopt;
+  if (!encoded)
+    return module.emitError("invalid finalized batch guard"), failure();
+  if (applied->plan().isMatrix()) {
+    auto old = llvm::json::parse(report.guardJSON);
+    auto wire = llvm::json::parse(*encoded);
+    if (!old || !wire || !old->getAsObject() || !wire->getAsObject())
+      return module.emitError("invalid matrix guard extensions"), failure();
+    for (auto &entry : *old->getAsObject())
+      if (entry.first.str().compare(0, 3, "cv_") == 0)
+        (*wire->getAsObject())[entry.first.str()] = std::move(entry.second);
+    encoded = llvm::formatv("{0}", *wire).str();
+  }
+  report.guardJSON = std::move(*encoded);
+  report.status = "REWRITTEN";
+  report.reason = "";
+  return success();
+}
+
+static LogicalResult rewriteVvSequentialIterations(
+    ModuleOp module, triton::FuncOp function, scf::ForOp scheduledLoop,
+    const BatchPlan &plan, BatchRewriteWorkspace &workspace,
+    ArrayRef<BatchEffectSource> sources, unsigned originalArgCount,
+    BatchRewriteReport &report) {
+  report.vvLowering = "sequential_iterations_v1";
+  report.selectedAxis = plan.axis();
+  report.laneWidth = plan.factor();
+  report.layoutJSON = serializeBatchLayouts(plan.layouts());
+  markVvAggregations(function);
+  markBatchEffects(workspace.analysis.sources.accesses);
+  workspace.invalidateSource();
+  if (failed(groupBatchLoopIterations(scheduledLoop, plan.factor())))
+    return failure();
+  if (failed(finalizeVvComputation(function, report.computationJSON, true,
+                                   plan.factor())))
+    return failure();
+  Builder builder(module.getContext());
+  module->setAttr("hacc.block_mapping_owner",
+                  builder.getStringAttr("block_batching"));
+  function->setAttr("hacc.block_mapping_owner",
+                    builder.getStringAttr("block_batching"));
+  // No program-grid transform or hidden extent arguments: program IDs,
+  // original loop strides and terminal recurrence slots keep their ABI.
+  if (failed(verify(module)))
+    return failure();
+  auto applied = BatchRewriteFinalizer::sequentialIterations(
+      module, plan, sources, originalArgCount);
+  if (!applied)
+    return failure();
+  return publishBatchAppliedRewrite(module, applied, report);
+}
+
+static LogicalResult finalizeVvProgramLanes(
+    ModuleOp module, const BatchPlan &plan, BatchRewriteWorkspace &workspace,
+    ArrayRef<BatchEffectSource> sources, Value group, unsigned originalArgCount,
+    bool semanticOnly, BatchRewriteReport &report) {
+  markBatchEffects(workspace.semanticAccesses);
+  auto layoutResults = initialBatchLayoutResults(plan.layouts());
+  if (!semanticOnly && failed(rewriteBatchMemoryViews(
+                           module, workspace.analysis, plan.layouts(),
+                           layoutResults, workspace.semanticAccesses, group,
+                           originalArgCount, plan.axis(), plan.factor())))
+    return failure();
+  // Inner layout transactions may replace the entire generated body.
+  workspace.invalidateGenerated();
+  report.layoutJSON = serializeBatchLayoutResults(layoutResults);
+  auto applied = BatchRewriteFinalizer::programLanes(
+      module, plan, sources, originalArgCount, layoutResults);
+  return publishBatchAppliedRewrite(module, applied, report);
+}
+
+static FailureOr<BatchRewriteReport>
+rewriteImpl(ModuleOp module, BatchRequest request,
+            BatchRewriteWorkspace &workspace, bool fuseControlFlow = false) {
   if (!request.isValid())
     return failure();
   BatchRewriteReport report;
@@ -747,6 +880,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   if (failed(normalizeBatchMemory(module, diagnosticOp, normalizationReason)))
     return reject(normalizationReason);
   normalizeIdentityReductionReshapes(function);
+  report.computationJSON = describeBatchComputation(function);
   auto &block = function.getBody().front();
   SmallVector<Operation *> originals;
   bool axes[3] = {};
@@ -853,12 +987,29 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         diagnosticOp = failedOp;
         return reject(reason);
       }
+      // VV currently preserves each original program's one-dimensional scan
+      // domain (including singleton shape variants). Other scan domains need
+      // a separate lowering contract; do not force them through a new axis or
+      // a wider column layout merely because their memory can be structured.
+      if (!request.cv && isa<triton::ScanOp>(op) &&
+          !hasBatchIndependentScanDomain(
+              cast<RankedTensorType>(op.getOperand(0).getType()),
+              op.getAttrOfType<IntegerAttr>("axis").getInt()))
+        return reject("VV_SCAN_DOMAIN_NOT_SUPPORTED");
       op.walk([&](Operation *nested) {
         if (nested != &op)
           ++report.operations[nested->getName().getStringRef().str()];
       });
     } else if (op.getNumRegions() && !isa<scf::IfOp, scf::ForOp>(op))
       return reject("BASIC_CONTROL_FLOW_NOT_IMPLEMENTED");
+  }
+  if (!request.cv) {
+    std::string reason;
+    Operation *failedOp = nullptr;
+    if (failed(verifyBatchAggregationDomains(function, reason, failedOp))) {
+      diagnosticOp = failedOp;
+      return reject(reason);
+    }
   }
   if (request.cv && !report.operations.count("tt.dot"))
     return reject("CV_DOT_REQUIRED");
@@ -893,21 +1044,35 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     return reject("NO_PROGRAM_AXIS");
   if (!axes[axis])
     return reject("UNUSED_BATCH_AXIS");
-  BatchPlan plan;
-  auto &access = plan.effects;
+  auto &facts = workspace.facts;
+  std::optional<BatchPlan> plan;
+  auto &access = workspace.analysis;
   access = analyzeBatchAccesses(function, indexBits, cvControlFlow);
   if (!access.reason.empty()) {
     if (access.operation)
       diagnosticOp = access.operation;
     return reject(access.reason);
   }
+  facts = std::make_shared<const BatchFacts>(
+      access.accesses, access.effects.accesses, access.loops);
+  if (!request.cv) {
+    // Only the shared layout compatibility view remains duplicated. The
+    // owned VV projection and loop table have a single authoritative owner.
+    access.effects.accesses.clear();
+    access.loops.clear();
+  }
+  ArrayRef<BatchLoopFact> loopFacts = facts->loops();
+  auto &replicatedLoads = workspace.replicatedLoads;
   if (request.axis < 0 && !request.cv && !request.semanticOnly) {
-    // Prefer a proven contiguous column region, without timing, factor
-    // selection or operator-specific patterns. Unknown/non-pointwise cases
-    // retain the deterministic axis picked above; explicit axes are fixed.
+    // Prefer a proven contiguous column region. Do not replace an axis that
+    // can form a complete group with a shorter column axis: that would leave
+    // lanes unused in every group. Unknown grids, tails on all available axes
+    // and explicitly requested axes retain their established behavior.
     SmallVector<int64_t, 3> extents = staticGridExtents(module);
     for (int candidate = 0; candidate < 3; ++candidate)
       if (axes[candidate] && (extents.empty() || extents[candidate] > 1) &&
+          (extents.empty() || extents[candidate] >= request.factor ||
+           extents[axis] < request.factor) &&
           hasBatchColumnPointwiseRegion(function, access, candidate,
                                         request.factor)) {
         axis = candidate;
@@ -915,11 +1080,11 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       }
   }
   report.guardJSON = access.guardJSON;
-  for (const auto &fact : access.accesses)
+  for (auto [id, fact] : llvm::enumerate(access.accesses))
     if (fact.deviceAddress)
-      plan.replicatedLoads.insert(fact.operation);
-  auto &control = plan.values;
-  control = analyzeBatchControlFlow(function, axis, plan.replicatedLoads);
+      replicatedLoads.insert(access.sources.accesses[id]);
+  auto &control = workspace.variation;
+  control = analyzeBatchControlFlow(function, axis, replicatedLoads);
   if (!control.reason.empty()) {
     diagnosticOp = control.operation;
     return reject(control.reason);
@@ -947,15 +1112,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   // 关卡 1：坐标归一。拿函数级的那份循环事实，按 id 找回关卡 0 认下的那条。
   const BatchLoopFact *programLoop = nullptr;
   if (form.programLoop) {
-    // 编号和采事实时一样，是同一个遍历里的序号（BatchAccessAnalysis.cpp:353-356）。
-    // 两边都是 function.walk 的默认次序，所以这里重数一遍就能对上。
-    unsigned id = 0, counter = 0;
-    function.walk([&](scf::ForOp loop) {
-      if (loop == form.programLoop)
-        id = counter;
-      ++counter;
-    });
-    for (const auto &fact : access.loops)
+    // Reuse the analysis traversal; IDs also index the serialized loop facts.
+    unsigned id =
+        access.sources.loopIDs.lookup(form.programLoop.getOperation());
+    for (const auto &fact : loopFacts)
       if (fact.id == id)
         programLoop = &fact;
     if (!programLoop) {
@@ -977,9 +1137,9 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   // Keep CV on the original byte-domain contract until an opaque-address
   // matrix proof is available.
   if (request.cv)
-    for (const auto &fact : access.accesses)
+    for (auto [id, fact] : llvm::enumerate(access.accesses))
       if (fact.deviceAddress) {
-        diagnosticOp = fact.operation;
+        diagnosticOp = access.sources.accesses[id];
         return reject("CV_DEVICE_ADDRESS_NOT_PROVEN");
       }
   bool sharedCV = false;
@@ -1007,66 +1167,33 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       }
     }
   }
-  auto guard = llvm::json::parse(access.guardJSON);
-  if (!guard || !guard->getAsObject())
-    return module.emitError("invalid generated access facts"), failure();
-  auto &object = *guard->getAsObject();
-  object["version"] = 3;
-  object["plan_kind"] = "unified";
-  object["semantic_contract_version"] = 4;
-  object["memory_policy"] = "disjoint_or_terminal_store";
-  object["factor"] = request.factor;
-  object["axis"] = axis;
-  llvm::json::Array obligations;
-  for (auto [id, fact] : llvm::enumerate(access.accesses)) {
-    const char *rule =
-        fact.deviceAddress ? "ReplicateEffect"
-        : fact.isVolatile  ? "PreserveVolatile"
-        : !fact.write && !control.isVarying(fact.operation->getResult(0))
-            ? "ShareInvariantLoad"
-        : fact.write ? "SupportedEffect"
-                     : "ReplicateEffect";
-    obligations.push_back(llvm::json::Object{
-        {"access_id", static_cast<int64_t>(id)},
-        {"rule", rule},
-        {"proof", (fact.write || fact.isVolatile || fact.normalizedPointer ||
-                   !control.isVarying(fact.operation->getResult(0)))
-                      ? "byte_domain"
-                      : "lane_correspondence"}});
+  auto proof = planBatchMemoryEffects(block, access, control, diagnosticOp);
+  if (failed(proof))
+    return reject("UNPROVEN_MEMORY_NONINTERFERENCE");
+  workspace.pendingProof = std::move(*proof);
+  workspace.proofAxis = axis;
+  workspace.proofFactor = request.factor;
+  if (request.cv) {
+    // Preserve the timing and content of legacy CV refusal diagnostics. The
+    // successful guard is published again from the finalized common plan.
+    auto guard = encodeBatchPendingGuard(*facts, *workspace.pendingProof, axis,
+                                         request.factor);
+    if (!guard)
+      return failure();
+    report.guardJSON = std::move(*guard);
   }
-  // Known intervals retain the runtime disjointness proof. An opaque read
-  // needs no host range when its only observable write is a terminal store
-  // whose value consumes that read. Independent outputs, volatile effects,
-  // region-local reads and writes preceding a read require a stronger proof.
-  SmallVector<triton::StoreOp> writes;
-  bool hasVolatile = false;
-  for (const auto &fact : access.accesses) {
-    if (fact.write)
-      writes.push_back(cast<triton::StoreOp>(fact.operation));
-    hasVolatile |= fact.isVolatile;
-  }
-  llvm::json::Array terminalReads;
-  if (!writes.empty())
-    for (auto [id, fact] : llvm::enumerate(access.accesses))
-      if (fact.deviceAddress) {
-        diagnosticOp = fact.operation;
-        auto read = cast<triton::LoadOp>(fact.operation);
-        if (writes.size() != 1 || hasVolatile || read->getBlock() != &block ||
-            writes.front()->getBlock() != &block ||
-            !read->isBeforeInBlock(writes.front().getOperation()) ||
-            !hasPureDataDependency(writes.front().getValue(), read.getResult()))
-          return reject("UNPROVEN_MEMORY_NONINTERFERENCE");
-        terminalReads.push_back(static_cast<int64_t>(id));
-      }
-  object["terminal_read_ids"] = std::move(terminalReads);
-  object["obligations"] = std::move(obligations);
-  report.guardJSON = llvm::formatv("{0}", *guard).str();
+  auto acceptMatrixPlan = [&](BatchStrategy strategy,
+                              SmallVector<BatchLayoutPlan, 0> layouts = {}) {
+    plan = BatchPlan::matrixLanes(facts, axis, request.factor, strategy,
+                                  std::move(layouts), *workspace.pendingProof);
+    return plan.has_value();
+  };
   // The same fact/coordinate/legality pipeline handles a single uniform
   // in-program loop as well as the existing cyclic program-axis loop.
   scf::ForOp scheduledLoop = form.programLoop;
   const BatchLoopFact *scheduledFact = programLoop;
   auto scheduledLegality = legality;
-  if (!scheduledLoop && access.loops.size() == 1 &&
+  if (!scheduledLoop && loopFacts.size() == 1 &&
       report.operations.count("scf.for") &&
       report.operations.at("scf.for") == 1) {
     function.walk([&](scf::ForOp loop) {
@@ -1077,10 +1204,14 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         scheduledLoop = loop;
     });
     if (scheduledLoop) {
-      scheduledFact = &access.loops.front();
+      scheduledFact = &loopFacts.front();
       scheduledLegality = isSafeToBatchLoop(scheduledFact, ranges, axis);
     }
   }
+  const unsigned originalArgCount = function.getNumArguments();
+  SmallVector<BatchEffectSource, 0> effectSources;
+  if (!request.cv)
+    effectSources = captureBatchEffectSources(access.sources, scheduledLoop);
   auto loopLowering = selectBatchLoopLowering(
       scheduledFact,
       scheduledLegality.axis ? &*scheduledLegality.axis : nullptr, ranges,
@@ -1089,51 +1220,38 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       loopLowering == BatchLoopLowering::SequentialIterations) {
     if (validated.size() > 8192 / request.factor)
       return reject("LOOP_GROUP_CODE_SIZE_EXCEEDED");
-    object["loop_schedule"] =
-        llvm::json::Object{{"version", 1},
-                           {"kind", "sequential_iterations_v1"},
-                           {"grid_policy", "preserve"},
-                           {"factor", request.factor},
-                           {"loop", batchLoopJSON(*scheduledFact)}};
-    report.guardJSON = llvm::formatv("{0}", *guard).str();
-    report.vvLowering = "sequential_iterations_v1";
-    report.selectedAxis = axis;
-    report.laneWidth = request.factor;
-    report.layoutJSON = serializeBatchLayouts({});
-    if (failed(groupBatchLoopIterations(scheduledLoop, request.factor)))
+    plan = BatchPlan::sequentialIterations(facts, axis, request.factor,
+                                           scheduledFact->id,
+                                           *workspace.pendingProof);
+    if (!plan)
+      return reject("INVALID_VV_PLAN");
+    if (failed(rewriteVvSequentialIterations(module, function, scheduledLoop,
+                                             *plan, workspace, effectSources,
+                                             originalArgCount, report)))
       return failure();
-    Builder builder(module.getContext());
-    module->setAttr("hacc.block_mapping_owner",
-                    builder.getStringAttr("block_batching"));
-    function->setAttr("hacc.block_mapping_owner",
-                      builder.getStringAttr("block_batching"));
-    // No program-grid transform or hidden extent arguments: program IDs,
-    // original loop strides and terminal recurrence slots keep their ABI.
-    if (failed(verify(module)))
-      return failure();
-    report.status = "REWRITTEN";
-    report.reason = "";
     return report;
   }
+  if (!request.cv)
+    markVvAggregations(function);
   bool maskedBatch = false;
   if (request.cv) {
     report.cvLowering = "rank3_batch_v1";
-    for (const auto &fact : access.accesses) {
+    for (auto [id, fact] : llvm::enumerate(access.accesses)) {
       Value mask;
-      if (auto load = dyn_cast<triton::LoadOp>(fact.operation))
+      if (auto load = dyn_cast<triton::LoadOp>(access.sources.accesses[id]))
         mask = load.getMask();
-      if (auto store = dyn_cast<triton::StoreOp>(fact.operation))
+      if (auto store = dyn_cast<triton::StoreOp>(access.sources.accesses[id]))
         mask = store.getMask();
       if (!mask || constantTrueMask(mask))
         continue;
-      diagnosticOp = fact.operation;
+      diagnosticOp = access.sources.accesses[id];
       if (!fact.mask || !structuredMaskExpr(fact.mask, cvControlFlow)) {
         unsigned budget = 1024;
         if (!cvControlFlow ||
             !structuredControlMask(mask, function, control, budget))
           return reject("CV_UNSTRUCTURED_MEMORY_MASK");
       }
-      if (auto load = dyn_cast<triton::LoadOp>(fact.operation);
+      if (auto load = dyn_cast<triton::LoadOp>(access.sources.accesses[id]);
           load && !constantZero(load.getOther()))
         return reject("CV_MASKED_LOAD_REQUIRES_ZERO_OTHER");
       ++report.structuredMasks;
@@ -1145,7 +1263,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         // in the lane-clone fallback. Try the complete region rewrite in a
         // nested sandbox; internal verification errors still propagate.
         OwningOpRef<ModuleOp> fused(module.clone());
-        auto attempt = rewriteImpl(fused.get(), request, true);
+        BatchRewriteWorkspace fusedWorkspace;
+        auto attempt = rewriteImpl(fused.get(), request, fusedWorkspace, true);
         if (failed(attempt))
           return failure();
         if (attempt->status == "REWRITTEN") {
@@ -1177,15 +1296,23 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
+      if (!acceptMatrixPlan(BatchStrategy::MatrixStaticLanes))
+        return reject("INVALID_BATCH_PLAN");
       if (failed(rewriteStructuredCV(module, function, originals, axis,
                                      request.factor)))
         return failure();
-      report.status = "REWRITTEN";
-      report.reason = "";
+      if (failed(
+              publishBatchAppliedRewrite(module,
+                                         BatchRewriteFinalizer::matrixLanes(
+                                             module, *plan, originalArgCount),
+                                         report)))
+        return failure();
       return report;
     }
     if (sharedCV) {
       std::string reason;
+      if (!acceptMatrixPlan(BatchStrategy::MatrixSpatial))
+        return reject("INVALID_BATCH_PLAN");
       if (failed(rewriteSpatialCV(module, function, axis, request.factor,
                                   report.cvLowering, reason))) {
         if (reason.empty())
@@ -1216,8 +1343,12 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
-      report.status = "REWRITTEN";
-      report.reason = "";
+      if (failed(
+              publishBatchAppliedRewrite(module,
+                                         BatchRewriteFinalizer::matrixLanes(
+                                             module, *plan, originalArgCount),
+                                         report)))
+        return failure();
       return report;
     }
     // The stock consumer has no linked int8->int32 batch-MMA implementation.
@@ -1242,11 +1373,17 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
+      if (!acceptMatrixPlan(BatchStrategy::MatrixStaticLanes))
+        return reject("INVALID_BATCH_PLAN");
       if (failed(rewriteStructuredCV(module, function, originals, axis,
                                      request.factor)))
         return failure();
-      report.status = "REWRITTEN";
-      report.reason = "";
+      if (failed(
+              publishBatchAppliedRewrite(module,
+                                         BatchRewriteFinalizer::matrixLanes(
+                                             module, *plan, originalArgCount),
+                                         report)))
+        return failure();
       return report;
     }
     if (request.cvBatchMatmul) {
@@ -1262,9 +1399,9 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           return reject("CV_BATCH_QUOTIENT_GROUP_CROSSES_PERIOD");
         }
       }
-      for (const auto &fact : access.accesses) {
+      for (auto [id, fact] : llvm::enumerate(access.accesses)) {
         if (!rectangularBatchMask(fact.mask, axis, fact.shape.size())) {
-          diagnosticOp = fact.operation;
+          diagnosticOp = access.sources.accesses[id];
           return reject("CV_BATCH_MASK_RECTANGLE_NOT_PROVEN");
         }
       }
@@ -1304,16 +1441,33 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
+      if (!acceptMatrixPlan(BatchStrategy::MatrixStaticLanes))
+        return reject("INVALID_BATCH_PLAN");
       if (failed(rewriteStructuredCV(module, function, originals, axis,
                                      request.factor)))
         return failure();
-      report.status = "REWRITTEN";
-      report.reason = "";
+      if (failed(
+              publishBatchAppliedRewrite(module,
+                                         BatchRewriteFinalizer::matrixLanes(
+                                             module, *plan, originalArgCount),
+                                         report)))
+        return failure();
       return report;
     }
   }
-  auto &layouts = plan.layouts;
-  layouts = planBatchLayouts(access, axis, request.factor);
+  auto proposedLayouts = planBatchLayouts(access, axis, request.factor);
+  if (request.cv) {
+    if (!acceptMatrixPlan(BatchStrategy::MatrixBatch,
+                          std::move(proposedLayouts)))
+      return reject("INVALID_BATCH_PLAN");
+  } else {
+    plan = BatchPlan::programLanes(facts, axis, request.factor,
+                                   std::move(proposedLayouts),
+                                   *workspace.pendingProof);
+    if (!plan)
+      return reject("INVALID_VV_PLAN");
+  }
+  ArrayRef<BatchLayoutPlan> layouts = plan->layouts();
   report.layoutJSON = serializeBatchLayouts(layouts);
   // Extend the existing pointwise memory-view requirement to a proved
   // uniform loop. Mere presence of scf.for is not a refusal: the loop facts
@@ -1360,17 +1514,17 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     for (const auto &plan : layouts)
       if (!access.accesses[plan.accessID].loops.empty() &&
           !plan.linearMemoryView) {
-        diagnosticOp = access.accesses[plan.accessID].operation;
+        diagnosticOp = access.sources.accesses[plan.accessID];
         return reject("LOOP_ACCESS_NOT_PROVEN");
       }
-  llvm::DenseMap<Operation *, unsigned> accessIDs;
-  SmallVector<Operation *> semanticAccesses(access.accesses.size(), nullptr);
+  auto &accessIDs = workspace.accessIDs;
+  auto &semanticAccesses = workspace.semanticAccesses;
+  semanticAccesses.resize(access.accesses.size(), nullptr);
   for (auto [id, fact] : llvm::enumerate(access.accesses))
-    accessIDs[fact.operation] = id;
+    accessIDs[access.sources.accesses[id]] = id;
   report.selectedAxis = axis;
   report.laneWidth = request.factor;
-  const int64_t lanes = report.laneWidth;
-  const unsigned originalArgCount = function.getNumArguments();
+  const int64_t lanes = plan->factor();
   if (failed(addProgramGridHiddenExtentArguments(function, 3)))
     return reject("HIDDEN_ARGUMENT_CONFLICT");
 
@@ -1420,7 +1574,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   Value base32 = rewriter.create<arith::TruncIOp>(loc, i32, base64);
   Value base32Vec = rewriter.create<triton::SplatOp>(loc, lane32, base32);
   Value pid = rewriter.create<arith::AddIOp>(loc, base32Vec, lane);
-  BatchValueMapping values;
+  auto &values = workspace.values;
   IRMapping &mapping = values.mapping;
   for (Value arg : function.getArguments())
     values.map(arg, arg, false);
@@ -1930,11 +2084,12 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   // source effect still owns exactly one generated operation at this stage.
   for (auto [id, fact] : llvm::enumerate(access.accesses)) {
     Operation *generated = semanticAccesses[id];
-    if (!generated || generated->getName() != fact.operation->getName())
+    if (!generated ||
+        generated->getName() != access.sources.accesses[id]->getName())
       return module.emitError("missing or invalid planned memory effect"),
              failure();
     if (auto load = dyn_cast<triton::LoadOp>(generated)) {
-      auto source = cast<triton::LoadOp>(fact.operation);
+      auto source = cast<triton::LoadOp>(access.sources.accesses[id]);
       if (load.getCache() != source.getCache() ||
           load.getEvict() != source.getEvict() ||
           load.getIsVolatile() != source.getIsVolatile())
@@ -1943,16 +2098,17 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   }
   // All layout facts are owned expressions. Drop original operation handles
   // before erasing source IR; only the generated semantic side table survives.
-  accessIDs.clear();
-  control.varying.clear();
-  plan.replicatedLoads.clear();
-  for (auto &fact : access.accesses)
-    fact.operation = nullptr;
+  workspace.invalidateSource();
   for (auto *op : llvm::reverse(originals))
     rewriter.eraseOp(op);
+  if (!request.cv &&
+      failed(finalizeVvComputation(function, report.computationJSON, false,
+                                   request.factor)))
+    return failure();
   ProgramGridTransformContract contract;
   contract.version = 3;
-  contract.transforms.push_back({0, axis, request.factor, false, false});
+  contract.transforms.push_back(
+      {0, plan->axis(), plan->factor(), false, false});
   if (failed(setProgramGridTransformContract(module, contract)))
     return module.emitError(
                "block batching generated an invalid grid contract"),
@@ -1986,43 +2142,28 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     module.walk([&](triton::DotOp dot) {
       dot->setAttr("tt.cv_batch_full_mkn", rewriter.getUnitAttr());
     });
-  if (!request.semanticOnly &&
-      failed(rewriteBatchMemoryViews(module, access, layouts, semanticAccesses,
-                                     group, originalArgCount, axis,
-                                     request.factor)))
-    return failure();
-  report.layoutJSON = serializeBatchLayouts(layouts);
-  report.status = "REWRITTEN";
-  llvm::json::Array layoutChecks;
-  for (const auto &plan : layouts)
-    if (plan.rewritten && !plan.runtimeGuardJSON.empty()) {
-      auto parsed = llvm::json::parse(plan.runtimeGuardJSON);
-      if (!parsed) {
-        llvm::consumeError(parsed.takeError());
-        return module.emitError("invalid generated layout guard"), failure();
-      }
-      layoutChecks.push_back(std::move(*parsed));
-    }
-  {
-    auto parsed = llvm::json::parse(report.guardJSON);
-    if (!parsed) {
-      llvm::consumeError(parsed.takeError());
-      return module.emitError("invalid original access guard"), failure();
-    }
-    if (!parsed->getAsObject())
-      return module.emitError("invalid original access guard"), failure();
-    auto *proofs = parsed->getAsObject()->getArray("obligations");
-    if (!proofs || proofs->size() != layouts.size())
-      return module.emitError("invalid effect proof mapping"), failure();
-    for (const auto &layout : layouts)
-      if (layout.rewritten)
-        (*proofs)[layout.accessID].getAsObject()->operator[]("proof") =
-            "byte_domain";
-    if (!layoutChecks.empty())
-      (*parsed->getAsObject())["layout_checks"] = std::move(layoutChecks);
-    report.guardJSON = llvm::formatv("{0}", *parsed).str();
+  if (!request.cv) {
+    if (failed(finalizeVvProgramLanes(module, *plan, workspace, effectSources,
+                                      group, originalArgCount,
+                                      request.semanticOnly, report)))
+      return failure();
+    return report;
   }
-  report.reason = "";
+  auto layoutResults = initialBatchLayoutResults(layouts);
+  if (!request.semanticOnly &&
+      failed(rewriteBatchMemoryViews(module, access, layouts, layoutResults,
+                                     semanticAccesses, group, originalArgCount,
+                                     axis, request.factor)))
+    return failure();
+  semanticAccesses.clear();
+  report.layoutJSON = serializeBatchLayoutResults(layoutResults);
+  report.status = "REWRITTEN";
+  if (failed(publishBatchAppliedRewrite(
+          module,
+          BatchRewriteFinalizer::matrixLanes(module, *plan, originalArgCount,
+                                             layoutResults),
+          report)))
+    return failure();
   return report;
 }
 namespace {
@@ -2030,7 +2171,17 @@ namespace {
 FailureOr<BatchRewriteReport>
 rewriteInSandbox(ModuleOp module, BatchRequest request, bool commit) {
   OwningOpRef<ModuleOp> sandbox(module.clone());
-  auto result = rewriteImpl(sandbox.get(), request);
+  BatchRewriteWorkspace workspace;
+  auto result = rewriteImpl(sandbox.get(), request, workspace);
+  if (!request.cv && succeeded(result) && result->status != "REWRITTEN" &&
+      workspace.pendingProof) {
+    auto diagnostic =
+        encodeBatchPendingGuard(*workspace.facts, *workspace.pendingProof,
+                                workspace.proofAxis, workspace.proofFactor);
+    if (!diagnostic)
+      return failure();
+    result->guardJSON = std::move(*diagnostic);
+  }
   if (commit && succeeded(result) && result->status == "REWRITTEN") {
     ModuleOp candidate = sandbox.get();
     module->setAttrs(candidate->getAttrs());

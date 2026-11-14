@@ -2,6 +2,7 @@
 #include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/BatchRewriteFinalizer.h"
 #include "TritonToGraph/BlockBatching/ControlFlowModels.h"
 #include "TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -72,7 +73,7 @@ std::string layoutRuntimeGuard(const BatchLayoutPlan &plan,
         for (const auto &loop : fact.loops)
           if (loop.id == term.id)
             bits = loop.bits;
-      value = K::leaf(term.kind, term.id, bits);
+      value = K::leaf(term.kind, term.id, bits, term.divisor);
     }
     if (!isConstant(term.coefficient, 1))
       value = mul(value, term.coefficient);
@@ -171,6 +172,16 @@ struct Emitter {
     case K::Program:
       return wide(r.create<triton::GetProgramIdOp>(
           loc, static_cast<triton::ProgramIDDim>(e->value)));
+    case K::ProgramQuotient:
+    case K::ProgramRemainder: {
+      assert(e->extent > 0 && "unproved program divisor");
+      Value pid = wide(r.create<triton::GetProgramIdOp>(
+          loc, static_cast<triton::ProgramIDDim>(e->value)));
+      Value divisor = constant(e->extent);
+      if (e->kind == K::ProgramQuotient)
+        return r.create<arith::DivSIOp>(loc, pid, divisor);
+      return r.create<arith::RemSIOp>(loc, pid, divisor);
+    }
     case K::Induction:
       // 查不到就是编号配不上，宁可崩在这里也不能发一条地址错了的访存。调用方在
       // 填表时已经把配不上的情形整条拒掉了，所以走到这里说明两边的约定破了。
@@ -257,7 +268,9 @@ struct Emitter {
     // 分支，对空的 e->lhs 解引用——不是报错，是直接崩。圈内偏移正是以这种叶子的
     // 形式出现在 rest term 里的。
     if (e->kind == K::Constant || e->kind == K::Argument ||
-        e->kind == K::Grid || e->kind == K::Program || e->kind == K::Induction)
+        e->kind == K::Grid || e->kind == K::Program ||
+        e->kind == K::Induction || e->kind == K::ProgramQuotient ||
+        e->kind == K::ProgramRemainder)
       return upper(e);
     if (e->kind == K::ExtSI)
       return expression(e->lhs);
@@ -436,6 +449,14 @@ struct PointwiseRegion {
     return result;
   }
 };
+
+// The same closed map covers [N] and [M, N]. Only the final contiguous
+// dimension is widened; other dimensions and scalar row origins are kept.
+bool pointwiseTile(const BatchLayoutPlan &plan) {
+  return (plan.shape.size() == 1 &&
+          plan.localAxes == SmallVector<int64_t>{0}) ||
+         (plan.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1});
+}
 } // namespace
 bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
                                    const BatchAccessReport &accesses, int axis,
@@ -449,20 +470,20 @@ bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
   for (const auto &plan : plans) {
     if (plan.action != BatchLayoutPlan::PointwiseRegion ||
         !plan.linearMemoryView || plan.shape != region.semanticShape ||
-        plan.localAxes != SmallVector<int64_t>{1} ||
-        !isConstant(plan.elementStride, 1) || !supportedUpper(plan.upper) ||
+        !pointwiseTile(plan) || !isConstant(plan.elementStride, 1) ||
+        !supportedUpper(plan.upper) ||
         llvm::any_of(plan.residualMasks, [&](BatchExprRef predicate) {
           return !supportedPredicate(predicate, axis, plan.localAxes);
         }))
       return false;
     const auto &access = accesses.accesses[plan.accessID];
     if (access.deviceAddress || !access.loops.empty() ||
-        access.operation->getBlock() != region.block)
+        accesses.sources.accesses[plan.accessID]->getBlock() != region.block)
       return false;
-    if (isa<triton::LoadOp>(access.operation))
-      region.loads.insert(access.operation);
-    else if (isa<triton::StoreOp>(access.operation))
-      region.stores.insert(access.operation);
+    if (isa<triton::LoadOp>(accesses.sources.accesses[plan.accessID]))
+      region.loads.insert(accesses.sources.accesses[plan.accessID]);
+    else if (isa<triton::StoreOp>(accesses.sources.accesses[plan.accessID]))
+      region.stores.insert(accesses.sources.accesses[plan.accessID]);
     else
       return false;
   }
@@ -487,12 +508,13 @@ bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
   return true;
 }
 
-LogicalResult rewriteBatchMemoryViews(ModuleOp module,
-                                      const BatchAccessReport &accesses,
-                                      SmallVectorImpl<BatchLayoutPlan> &plans,
-                                      ArrayRef<Operation *> semanticAccesses,
-                                      Value group, unsigned originalArgCount,
-                                      int axis, int64_t factor) {
+LogicalResult
+rewriteBatchMemoryViews(ModuleOp module, const BatchAccessReport &accesses,
+                        ArrayRef<BatchLayoutPlan> plans,
+                        SmallVectorImpl<BatchLayoutResult> &results,
+                        ArrayRef<Operation *> semanticAccesses, Value group,
+                        unsigned originalArgCount, int axis, int64_t factor) {
+  auto attempts = initialBatchLayoutResults(plans);
   IRMapping mapping;
   OwningOpRef<ModuleOp> sandbox(cast<ModuleOp>(module->clone(mapping)));
   auto function = *sandbox->getOps<triton::FuncOp>().begin();
@@ -519,7 +541,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                  }) &&
                     plan.action == BatchLayoutPlan::PointwiseRegion &&
                     plan.shape == first->shape &&
-                    plan.localAxes == SmallVector<int64_t>{1};
+                    plan.localAxes == first->localAxes && pointwiseTile(plan);
       Operation *op = mapping.lookupOrNull(semanticAccesses[plan.accessID]);
       if (!op || op->getBlock() != region.block) {
         compatible = false;
@@ -531,22 +553,27 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
         region.stores.insert(op);
     }
     if (compatible) {
-      region.semanticShape = {factor, first->shape[0], first->shape[1]};
-      region.targetShape = {first->shape[0], factor * first->shape[1]};
+      region.semanticShape = {factor};
+      llvm::append_range(region.semanticShape, first->shape);
+      region.targetShape = first->shape;
+      region.targetShape.back() *= factor;
       compatible = region.verify();
     }
     if (!compatible) {
-      for (auto &plan : plans)
+      for (auto &result : attempts) {
+        auto &plan = result.layout;
         if (plan.action == BatchLayoutPlan::PointwiseRegion) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "EXPENSIVE_LAYOUT_BRIDGE";
           plan.linearMemoryView = false;
         }
+      }
       columnRegion = false;
     }
   }
   bool changed = false;
-  for (auto &plan : plans) {
+  for (auto &result : attempts) {
+    auto &plan = result.layout;
     if (!plan.linearMemoryView || !supportedUpper(plan.upper) ||
         llvm::any_of(plan.residualMasks, [&](BatchExprRef predicate) {
           return !supportedPredicate(predicate, axis, plan.localAxes);
@@ -685,7 +712,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                                   e.upper(plan.elementOrigin));
     Value offset = offsetRange;
     for (const auto &term : plan.restTerms) {
-      Value value = e.expression(K::leaf(term.kind, term.id, 32));
+      Value value = e.expression(K::leaf(term.kind, term.id, 32, term.divisor));
       Value scale = e.upper(term.coefficient);
       if (isa<RankedTensorType>(value.getType()))
         scale = e.splat(scale);
@@ -728,6 +755,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
           e.loc, pointer, mask, other, load.getBoundaryCheck(),
           load.getPadding(), load.getCache(), load.getEvict(),
           load.getIsVolatile());
+      copyBatchEffectIdentity(op, replacement);
       if (auto marker = load->getAttr("was_bool_to_int8"))
         replacement->setAttr("was_bool_to_int8", marker);
       if (inColumnRegion)
@@ -743,19 +771,22 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       Value stored = inColumnRegion
                          ? region.materialize(store.getValue(), rewriter)
                          : e.reshape(store.getValue(), targetShape);
-      rewriter.create<triton::StoreOp>(e.loc, pointer, stored, mask,
-                                       store.getBoundaryCheck(),
-                                       store.getCache(), store.getEvict());
+      auto replacement = rewriter.create<triton::StoreOp>(
+          e.loc, pointer, stored, mask, store.getBoundaryCheck(),
+          store.getCache(), store.getEvict());
+      copyBatchEffectIdentity(op, replacement);
       rewriter.eraseOp(op);
     }
     if (plan.symbolic)
-      plan.runtimeGuardJSON = layoutRuntimeGuard(
+      result.runtimeGuardJSON = layoutRuntimeGuard(
           plan, fact, targetShape, coordinateMap, fusedTarget, axis, factor);
-    plan.rewritten = true;
+    result.rewritten = true;
     changed = true;
   }
-  if (!changed)
+  if (!changed) {
+    results.assign(attempts.begin(), attempts.end());
     return success();
+  }
   if (columnRegion) {
     SmallVector<Operation *> dead;
     for (Operation &op : *region.block)
@@ -775,6 +806,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
            failure();
   module->setAttrs((*sandbox)->getAttrs());
   module.getBodyRegion().takeBody(sandbox->getBodyRegion());
+  results.assign(attempts.begin(), attempts.end());
   return success();
 }
 } // namespace mlir::triton::cfg

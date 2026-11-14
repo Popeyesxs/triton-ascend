@@ -1,75 +1,159 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-#ifndef TRITON_TO_GRAPH_BLOCK_BATCHING_BATCH_PLAN_H
-#define TRITON_TO_GRAPH_BLOCK_BATCHING_BATCH_PLAN_H
-
-#include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
-#include "TritonToGraph/BlockBatching/ControlFlowModels.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/StringRef.h"
-#include <cstdint>
-#include <map>
-#include <string>
+#ifndef TRITON_TO_GRAPH_BLOCK_BATCHING_PLAN_H
+#define TRITON_TO_GRAPH_BLOCK_BATCHING_PLAN_H
+#include "TritonToGraph/BlockBatching/BatchFacts.h"
+#include "TritonToGraph/BlockBatching/BatchLayoutFacts.h"
+#include <memory>
+#include <optional>
 
 namespace mlir::triton::cfg {
-
-struct BatchPlan {
-  BatchAccessReport effects;
-  BatchControlFlowPlan values;
-  SmallVector<BatchLayoutPlan, 0> layouts;
-  llvm::DenseSet<Operation *> replicatedLoads;
+enum class BatchSchedule { ProgramLanes, SequentialIterations };
+// Strategy describes lowering semantics, not a second class hierarchy.
+enum class BatchStrategy {
+  VectorLanes,
+  SequentialLoop,
+  MatrixStaticLanes,
+  MatrixSpatial,
+  MatrixBatch
 };
 
-enum class BlockMappingOwner { None, BlockBatching, Legacy };
-
-struct BatchRequest {
-  int64_t factor = 1;
-  int32_t axis = -1;
-  bool semanticOnly = false;
-  // CV supports independent lanes or a proved shared-operand spatial tile.
-  // The dispatcher proves a full group before launching either candidate.
-  bool cv = false;
-  // Opt-in independent rank-three lowering. Preserve rectangular masks;
-  // the guard proves complete reduction axes and unchanged padded footprints.
-  bool cvBatchMatmul = false;
-  bool isValid() const { return factor > 0 && axis >= -1 && axis <= 2; }
+enum class BatchEffectRule {
+  ReplicateEffect,
+  PreserveVolatile,
+  ShareInvariantLoad,
+  SupportedEffect
+};
+inline const char *batchEffectRuleName(BatchEffectRule rule) {
+  switch (rule) {
+  case BatchEffectRule::ReplicateEffect:
+    return "ReplicateEffect";
+  case BatchEffectRule::PreserveVolatile:
+    return "PreserveVolatile";
+  case BatchEffectRule::ShareInvariantLoad:
+    return "ShareInvariantLoad";
+  case BatchEffectRule::SupportedEffect:
+    return "SupportedEffect";
+  }
+  return nullptr;
+}
+enum class BatchEffectProof { ByteDomain, LaneCorrespondence };
+struct BatchEffectObligation {
+  unsigned accessID;
+  BatchEffectRule rule;
+  BatchEffectProof proof;
+};
+// Owned planning output. These are obligations, not proofs of runtime inputs.
+struct BatchProofObligations {
+  llvm::SmallVector<BatchEffectObligation, 0> effects;
+  llvm::SmallVector<unsigned, 0> terminalReads;
+  bool validFor(const BatchFacts &facts) const {
+    if (effects.size() != facts.accesses().size())
+      return false;
+    for (unsigned id = 0; id < effects.size(); ++id)
+      if (effects[id].accessID != id ||
+          !batchEffectRuleName(effects[id].rule) ||
+          (effects[id].proof != BatchEffectProof::ByteDomain &&
+           effects[id].proof != BatchEffectProof::LaneCorrespondence))
+        return false;
+    for (unsigned id : terminalReads)
+      if (id >= effects.size())
+        return false;
+    return true;
+  }
 };
 
-// No MLIR Value survives this read-only analysis. It may be serialized into
-// compiler metadata, but must never authorize a transformed launch.
-struct BatchAnalysisReport {
-  std::string status = "REJECTED";
-  std::string reason;
-  std::string location;
-  std::string operation;
-  std::string context;
-  std::string layoutJSON;
-  std::map<std::string, unsigned> operations;
+// An accepted decision owns immutable original-domain facts and layout plans.
+// Grid and hidden ABI are derived from schedule, never independently set flags.
+class BatchPlan {
+public:
+  static std::optional<BatchPlan>
+  programLanes(std::shared_ptr<const BatchFacts> facts, int axis,
+               int64_t factor, llvm::SmallVector<BatchLayoutPlan, 0> layouts,
+               BatchProofObligations proof) {
+    if (!validRequest(facts, axis, factor) ||
+        layouts.size() != facts->accesses().size() || !proof.validFor(*facts))
+      return std::nullopt;
+    for (unsigned id = 0; id < layouts.size(); ++id)
+      if (layouts[id].accessID != id)
+        return std::nullopt;
+    return BatchPlan(std::move(facts), axis, factor,
+                     BatchSchedule::ProgramLanes, BatchStrategy::VectorLanes,
+                     {}, std::move(layouts), std::move(proof));
+  }
+  static std::optional<BatchPlan>
+  sequentialIterations(std::shared_ptr<const BatchFacts> facts, int axis,
+                       int64_t factor, unsigned loopID,
+                       BatchProofObligations proof) {
+    if (!validRequest(facts, axis, factor) || !facts->findLoop(loopID) ||
+        !proof.validFor(*facts))
+      return std::nullopt;
+    return BatchPlan(
+        std::move(facts), axis, factor, BatchSchedule::SequentialIterations,
+        BatchStrategy::SequentialLoop, loopID, {}, std::move(proof));
+  }
+  static std::optional<BatchPlan>
+  matrixLanes(std::shared_ptr<const BatchFacts> facts, int axis, int64_t factor,
+              BatchStrategy strategy,
+              llvm::SmallVector<BatchLayoutPlan, 0> layouts,
+              BatchProofObligations proof) {
+    if (!validRequest(facts, axis, factor) || !proof.validFor(*facts) ||
+        (strategy != BatchStrategy::MatrixStaticLanes &&
+         strategy != BatchStrategy::MatrixSpatial &&
+         strategy != BatchStrategy::MatrixBatch))
+      return std::nullopt;
+    if (strategy == BatchStrategy::MatrixBatch) {
+      if (layouts.size() != facts->accesses().size())
+        return std::nullopt;
+      for (unsigned id = 0; id < layouts.size(); ++id)
+        if (layouts[id].accessID != id)
+          return std::nullopt;
+    } else if (!layouts.empty())
+      return std::nullopt;
+    return BatchPlan(std::move(facts), axis, factor,
+                     BatchSchedule::ProgramLanes, strategy, {},
+                     std::move(layouts), std::move(proof));
+  }
+  BatchStrategy strategy() const { return selectedStrategy; }
+  bool isMatrix() const {
+    return selectedStrategy == BatchStrategy::MatrixStaticLanes ||
+           selectedStrategy == BatchStrategy::MatrixSpatial ||
+           selectedStrategy == BatchStrategy::MatrixBatch;
+  }
+  const BatchFacts &facts() const { return *sourceFacts; }
+  int axis() const { return selectedAxis; }
+  int64_t factor() const { return laneWidth; }
+  BatchSchedule schedule() const { return selectedSchedule; }
+  bool preservesGrid() const {
+    return selectedSchedule == BatchSchedule::SequentialIterations;
+  }
+  unsigned hiddenExtentCount() const { return preservesGrid() ? 0 : 3; }
+  const BatchLoopFact *groupedLoop() const {
+    return loopID ? sourceFacts->findLoop(*loopID) : nullptr;
+  }
+  llvm::ArrayRef<BatchLayoutPlan> layouts() const { return layoutPlans; }
+  const BatchProofObligations &proof() const { return proofObligations; }
+
+private:
+  static bool validRequest(const std::shared_ptr<const BatchFacts> &facts,
+                           int axis, int64_t factor) {
+    return facts && axis >= 0 && axis < 3 && factor > 1 && factor <= INT32_MAX;
+  }
+  BatchPlan(std::shared_ptr<const BatchFacts> facts, int axis, int64_t factor,
+            BatchSchedule schedule, BatchStrategy strategy,
+            std::optional<unsigned> loop,
+            llvm::SmallVector<BatchLayoutPlan, 0> layouts,
+            BatchProofObligations proof)
+      : sourceFacts(std::move(facts)), selectedAxis(axis), laneWidth(factor),
+        selectedSchedule(schedule), selectedStrategy(strategy), loopID(loop),
+        layoutPlans(std::move(layouts)), proofObligations(std::move(proof)) {}
+  std::shared_ptr<const BatchFacts> sourceFacts;
+  int selectedAxis;
+  int64_t laneWidth;
+  BatchSchedule selectedSchedule;
+  BatchStrategy selectedStrategy;
+  std::optional<unsigned> loopID;
+  llvm::SmallVector<BatchLayoutPlan, 0> layoutPlans;
+  BatchProofObligations proofObligations;
 };
-
-struct BatchRewriteReport : BatchAnalysisReport {
-  std::string guardJSON;
-  std::string cvMode = "disabled";
-  std::string cvLowering = "disabled";
-  std::string vvLowering = "disabled";
-  unsigned structuredMasks = 0;
-  int selectedAxis = -1;
-  int64_t laneWidth = 1;
-};
-void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
-                        llvm::StringRef reason);
-
-// 成功时把改写结果提交回 module。
-FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module,
-                                                   BatchRequest request);
-
-// 同样的改写，但**绝不提交**：module 一个字节都不变。干跑用这条。
-// 在它之前，干跑只能靠在外面再 clone 一层来躲开上面那次提交，于是一次干跑要把
-// 整个模块 clone 两遍。
-FailureOr<BatchRewriteReport> probeBlockBatching(ModuleOp module,
-                                                 BatchRequest request);
-
-FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
-                                                    BatchRequest request);
 } // namespace mlir::triton::cfg
 #endif

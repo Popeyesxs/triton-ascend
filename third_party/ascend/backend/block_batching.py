@@ -7,7 +7,7 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 45
+IMPLEMENTATION_VERSION = 55
 
 
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
@@ -59,18 +59,36 @@ def get_launch_handler():
     return _launch_handler
 
 
+def _has_independent_row_layout(report):
+    """Recognize top-level row accesses already covered by the source proof.
+
+    This does not certify the backend memory form. The subsequent lowering
+    check and per-launch byte-domain proof remain mandatory.
+    """
+    if any(report.get("operations", {}).get(op) for op in ("scf.for", "scf.if")):
+        return False
+    accesses = report.get("layout", {}).get("accesses", [])
+    return bool(accesses) and all(
+        access.get("control_flow_independent") is True and access.get("proof_scope") == "existing_guard_no_wrap"
+        and access.get("action") == "Keep" and access.get("rewritten") is False
+        and access.get("reason") == "ALREADY_STRUCTURED" and access.get("mask_class") == "independent_axes" and
+        (shape := access.get("original_shape", [])) and all(type(extent) is int and extent > 0
+                                                            for extent in shape) and sum(extent != 1
+                                                                                         for extent in shape) <= 1
+        for access in accesses)
+
+
 def vv_layout_refusal(report):
     """Conservative structural matching for independent row pointwise bodies.
 
-    Without row aggregation, retaining separate row views adds the dynamic
-    batch prefix without forming the memory view used by contiguous pointwise
-    batching. Shared scalar/vector parameters do not establish that view for
-    the independent rows. Keep this class on the original kernel until its
-    row lowering is improved. This policy does not estimate latency
-    or inspect kernel names, grid sizes, tile widths or measured timings.
+    Proven top-level rows may use the structured backend path. Incomplete
+    layout evidence, shared accesses and control-flow bodies retain the
+    existing refusal. No kernel names or measured timings enter this policy.
     """
     if (report.get("owner") != "block_batching" or report.get("cv_mode") != "disabled"
             or report.get("lane_width", 1) <= 1):
+        return None
+    if _has_independent_row_layout(report):
         return None
     operations = report.get("operations", {})
     if (not operations.get("tt.load") or not operations.get("tt.store")
@@ -98,19 +116,101 @@ def vv_layout_refusal(report):
     return None
 
 
+def vv_computation_refusal(report):
+    """Require the native original-domain contract, independently of memory.
+
+    The native verifier checks combiners, effects and loop-carried values.
+    This boundary checks that their domain contract reached the compiler;
+    neither operation counts nor a successful memory conversion replace it.
+    """
+    if (report.get("owner") != "block_batching" or report.get("cv_mode") != "disabled"
+            or report.get("lane_width", 1) <= 1):
+        return None
+    computation = report.get("computation", {})
+    schedule = "sequential_iterations" if report.get("vv_lowering") == "sequential_iterations_v1" else "program_lanes"
+    if (computation.get("version") != 2 or computation.get("scope") != "normalized_original_program"
+            or computation.get("stage") != "semantic_ttir_before_memory_views"
+            or computation.get("schedule") != schedule or computation.get("lane_policy") != "separate_original_domains"
+            or not isinstance(computation.get("aggregations"), list)):
+        return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+    expected = {"reduce": "original_program_reduction", "scan": "independent_row_scan"}
+    counts = {kind: 0 for kind in expected}
+    target_ids = set()
+    for source_id, aggregation in enumerate(computation["aggregations"]):
+        if (not isinstance(aggregation, dict) or type(aggregation.get("id")) is not int
+                or aggregation["id"] != source_id):
+            return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+        kind = aggregation.get("kind")
+        if kind not in expected or aggregation.get("domain") != expected[kind]:
+            return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+        axis = aggregation.get("original_axis")
+        shape = aggregation.get("original_shape")
+        targets = aggregation.get("mapped_operations")
+        if (type(axis) is not int or not isinstance(shape, list) or not 0 <= axis < len(shape)
+                or any(type(d) is not int or d <= 0 for d in shape) or not isinstance(targets, list) or not targets
+                or (schedule == "program_lanes" and len(targets) != 1)):
+            return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+        for target in targets:
+            if not isinstance(target, dict):
+                return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+            prefix = target.get("batch_prefix")
+            target_id = target.get("id")
+            if (type(prefix) is not bool or (schedule == "sequential_iterations" and prefix)
+                    or type(target_id) is not int or target_id < 0 or target_id in target_ids
+                    or type(target.get("axis")) is not int or type(aggregation.get("lifted_axis")) is not int
+                    or target.get("axis") != axis + int(prefix) or aggregation.get("lifted_axis") != target.get("axis")
+                    or target.get("shape") != ([report["lane_width"]] + shape if prefix else shape)):
+                return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+            target_ids.add(target_id)
+        counts[kind] += 1
+    if target_ids != set(range(len(target_ids))):
+        return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+    if any(count != report.get("operations", {}).get("tt." + kind, 0) for kind, count in counts.items()):
+        return "VV_COMPUTATION_DOMAIN_NOT_PROVEN"
+    return None
+
+
+def vv_memory_lowering_refusal(report):
+    """Keep VV candidates on supported memory paths after layout lowering.
+
+    Independent row reductions and scans remain supported. Their presence
+    does not prove that a batched access became a structured memory view:
+    reject residual indirect GM helpers regardless of the compute body.
+    Internal tensor gathers and SIMT arithmetic are not memory refusals.
+    """
+    if (report.get("owner") != "block_batching" or report.get("cv_mode") != "disabled"
+            or report.get("lane_width", 1) <= 1):
+        return None
+    observation = report.get("layout", {}).get("lowering_observation")
+    if (not isinstance(observation, dict) or observation.get("stage") != "ttadapter"
+            or observation.get("scope") != "module" or any(
+                type(observation.get(key)) is not int or observation[key] < 0
+                for key in ("indirect_load_ops", "indirect_store_ops"))):
+        return "VV_MEMORY_LOWERING_NOT_PROVEN"
+    if observation.get("indirect_load_ops", 0) or observation.get("indirect_store_ops", 0):
+        return "VV_INDIRECT_MEMORY_NOT_SUPPORTED"
+    return None
+
+
 def memory_compile_options(metadata, compiler_path, supports_inlining):
-    """Inline dynamic contiguous DMA helpers only in VV batching candidates.
+    """Inline contiguous or proved independent-row DMA in VV candidates.
 
     This is a lowering policy, not a factor selector or a profitability test.
     Unsupported compiler versions retain their normal candidate compilation.
     """
     report = metadata.get("block_batching", {})
     lowering = report.get("memory_lowering", {})
+    observation = report.get("layout", {}).get("lowering_observation", {})
+    row_copy = (_has_independent_row_layout(report) and observation.get("stage") == "ttadapter"
+                and observation.get("scope") == "module" and observation.get("indirect_load_ops") == 0
+                and observation.get("indirect_store_ops") == 0 and type(observation.get("memref_copy_ops")) is int
+                and observation["memref_copy_ops"] > 0)
     if (metadata.get("block_batching_factor", 1) <= 1 or report.get("owner") != "block_batching"
-            or report.get("cv_mode") != "disabled" or lowering.get("dynamic_contiguous_copy") is not True
+            or report.get("cv_mode") != "disabled" or not (lowering.get("dynamic_contiguous_copy") is True or row_copy)
             or not metadata["target"].arch.startswith("Ascend950") or metadata.get("mix_mode") != "aiv"
             or metadata.get("parallel_mode") != "simd"):
         return []
+    lowering["structured_row_copy"] = row_copy
     lowering["libcall_inlining"] = bool(supports_inlining(compiler_path))
     return ["--enable-lib-call-no-inline=false"] if lowering["libcall_inlining"] else []
 
@@ -298,13 +398,21 @@ class BatchKernel:
         import threading
         from collections import namedtuple
         self.baseline, self.candidate = baseline, candidate
+        self._vv_mode = report.get("cv_mode") == "disabled"
+        if self._vv_mode:
+            from copy import deepcopy
+            report = deepcopy(report)
         self.request, self.block_batching = request, report
         self.positions = positions
         from .block_batching_report import validate_vv_loop_contract
         self._preserve_grid = (validate_vv_loop_contract(candidate.metadata._asdict())
                                if candidate is not None else False)
-        from .block_batching_guard import RuntimeGuard
-        self._guard = RuntimeGuard(report["guard"], request.factor) if candidate is not None else None
+        from .block_batching_contract import ExecutionContract
+        self._contract = (ExecutionContract.from_validated_candidate(
+            candidate, request, report, positions, self._preserve_grid) if candidate is not None else None)
+        # Legacy performance diagnostics inspect this evaluator. Dispatch and
+        # ownership stay in the common contract; this is an alias, not a copy.
+        self._guard = self._contract._guard if self._contract is not None and not self._vv_mode else None
         self._primary = candidate if candidate is not None else baseline
         self._lock = threading.RLock()
         self._ready = False
@@ -327,7 +435,11 @@ class BatchKernel:
 
     @property
     def last_launch(self):
-        return getattr(self._local, "launch", {"runtime_status": "NOT_LAUNCHED"})
+        result = getattr(self._local, "launch", {"runtime_status": "NOT_LAUNCHED"})
+        if self._vv_mode:
+            from copy import deepcopy
+            return deepcopy(result)
+        return result
 
     def _init_handles(self):
         with self._lock:
@@ -345,6 +457,7 @@ class BatchKernel:
                 except (BatchingRejected, OutOfResources) as error:
                     self.block_batching.update(compile_status="REJECTED", reason=str(error), owner="none")
                     self.candidate = None
+                    self._contract = None
                     self._primary = self.baseline
                     from collections import namedtuple
                     fields = dict(self.baseline.metadata._asdict(), block_batching=self.block_batching)
@@ -373,49 +486,34 @@ class BatchKernel:
         reason = self.block_batching.get("reason", "CANDIDATE_UNAVAILABLE")
         accepted = False
         arguments = launch[9:]
+        contract = self._contract
         if self.candidate is not None:
             capture = _capture_state()
-            if _is_cv_report(self.block_batching) and grid[self.block_batching["selected_axis"]] % self.request.factor:
-                # VV candidates protect partial groups with a lane mask and
-                # safe inactive operands. CV still requires complete groups.
-                reason = "CV_GRID_NOT_DIVISIBLE"
-            elif not self._preserve_grid and not _reduces_blocks(grid, self.block_batching["selected_axis"],
-                                                                 self.request.factor):
-                # The device task domain is one dimensional: prepareGrid divides
-                # the selected axis and then multiplies all three extents. An
-                # axis too short to divide leaves that product untouched while
-                # the rewritten tile is still F times wider, so every lane past
-                # the original extent is masked-off work bought for nothing.
-                reason = "GRID_NOT_REDUCED"
-            elif _batched_blocks(grid, self.block_batching["selected_axis"],
-                                 1 if self._preserve_grid else self.request.factor) < _core_floor():
-                # Apply the configured available-core scheduling floor. Its
-                # performance tradeoff is validated separately by workload.
-                reason = "GRID_BELOW_CORE_FLOOR"
-            elif capture is not False:
-                reason = "CAPTURE_BASELINE" if capture else "CAPTURE_QUERY_UNAVAILABLE"
-            else:
-                runtime_args = [arguments[index] for index in self.positions]
-                accepted, reason = self._guard(runtime_args, grid)
+            reason = contract.launch_refusal(grid, capture, reduces_blocks=_reduces_blocks,
+                                             batched_blocks=_batched_blocks, core_floor=_core_floor)
+            if reason is None:
+                accepted, reason = contract.prove(arguments, grid)
                 if accepted:
-                    selected = self.candidate
+                    selected = contract.candidate
         # Never mix baseline function/metadata/workspace/layout with candidate.
         forwarded = list(launch)
         forwarded[4], forwarded[5] = selected.function, selected.packed_metadata
         forwarded[6] = selected.launch_metadata(grid, launch[3], *arguments)
         result = selected.run(*forwarded)
-        factor = self.request.factor if accepted else 1
+        requested_factor = contract.factor if contract is not None else self.request.factor
+        preserve_grid = contract.preserve_grid if contract is not None else self._preserve_grid
+        axis = contract.axis if contract is not None else self.block_batching.get("selected_axis")
+        factor = requested_factor if accepted else 1
         batch_grid = list(grid)
-        if accepted and not self._preserve_grid:
-            axis = self.block_batching["selected_axis"]
+        if accepted and not preserve_grid:
             batch_grid[axis] = (grid[axis] + factor - 1) // factor
         self._local.launch = {
             "runtime_status": "APPLIED" if accepted else "BASELINE_SELECTED", "owner":
-            "block_batching" if accepted else "baseline", "requested_factor": self.request.factor, "applied_factor":
-            factor, "selected_axis": self.block_batching.get("selected_axis"), "original_grid": grid, "batch_grid":
-            tuple(batch_grid), "reason": reason, "plan_id": self.hash
+            "block_batching" if accepted else "baseline", "requested_factor": requested_factor, "applied_factor":
+            factor, "selected_axis": axis, "original_grid": grid, "batch_grid": tuple(batch_grid), "reason": reason,
+            "plan_id": self.hash
         }
-        self._local.launch['grouping'] = 'loop_iterations' if accepted and self._preserve_grid else 'programs'
+        self._local.launch['grouping'] = 'loop_iterations' if accepted and preserve_grid else 'programs'
         if knobs.ascend.compile_only:
             self._local.launch.update(runtime_status="NOT_LAUNCHED", reason="COMPILE_ONLY")
         return result
@@ -476,7 +574,6 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
 
 def compile_bundle(backend, src, options, compile_variant):
     import subprocess
-    import hashlib
     from triton.compiler.errors import MLIRCompilationError
     request = BatchRequest(options.get("block_batching_factor", 1), options.get("block_batching_axis", -1))
     normalized = backend.parse_options(options)
@@ -508,29 +605,8 @@ def compile_bundle(backend, src, options, compile_variant):
             raise BatchingRejected("AST_SOURCE_REQUIRED")
         positions = _runtime_positions(src)
         candidate, layout_fallback = _compile_layout_candidate(compile_variant, options, frozen, request)
-        from .block_batching_report import VALIDATION_POLICY, CV_VALIDATION_POLICY
-        native_report = getattr(candidate.metadata, "block_batching", {})
-        cv = _is_cv_report(native_report)
-        if (native_report.get("cv_mode") not in ("disabled", "independent_batch_v1", "spatial_concat_v1")
-                or native_report.get("compile_status") != "COMPILED_GUARDED"
-                or native_report.get("validation_policy") != (CV_VALIDATION_POLICY if cv else VALIDATION_POLICY)):
-            raise BatchingRejected("CANDIDATE_VALIDATION_MISSING")
-        if (native_report.get("implementation_version") != IMPLEMENTATION_VERSION
-                or native_report.get("lane_width") != request.factor):
-            raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
-        if cv and native_report.get("tail_policy") != "full_groups_only":
-            raise BatchingRejected("CV_CONTRACT_MISMATCH")
-        expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
-        if expected != hashlib.sha256(candidate.kernel).hexdigest():
-            raise BatchingRejected("CANDIDATE_BINARY_CHANGED")
-        from .block_batching_guard_v3 import validate_plan_binding
-        guard = native_report.get("guard", {})
-        if (not validate_plan_binding(guard)
-                or getattr(candidate.metadata, "block_batching_plan_sha256", None) != guard.get("plan_fingerprint")):
-            raise BatchingRejected("CANDIDATE_PLAN_CHANGED")
-        from .block_batching_report import validate_vv_loop_contract
-        validate_vv_loop_contract(candidate.metadata._asdict())
-        report = dict(native_report)
+        from .block_batching_report import validated_candidate_report
+        report = validated_candidate_report(candidate, request, IMPLEMENTATION_VERSION)
         if layout_fallback:
             report["layout"] = dict(report["layout"], requested_policy="auto", selected_policy="semantic_only",
                                     compile_fallback=layout_fallback)
