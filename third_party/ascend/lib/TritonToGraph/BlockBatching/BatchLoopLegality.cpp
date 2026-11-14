@@ -3,19 +3,19 @@
 
 namespace mlir::triton::cfg {
 
-BatchLoopLegality isSafeToBatchLoop(const BatchLoopFact *programLoop,
-                                    const BatchRangeFacts &ranges,
-                                    int gridAxis) {
+BatchResult<std::optional<BatchLogicalAxis>>
+isSafeToBatchLoop(const BatchLoopFact *programLoop, int gridAxis) {
   // 关卡 0 的结论由调用方给出（BatchLoopForm.h）。没有程序轴循环是合法形态而
   // 不是失败：直线 kernel 与只含块内循环的 kernel 都走这一支，交回既有的程序级
   // 加宽路径，循环一条都不动。
+  using Result = BatchResult<std::optional<BatchLogicalAxis>>;
   if (!programLoop)
-    return {true, "", std::nullopt};
+    return Result::success(std::nullopt);
 
   // 关卡 1：坐标归一。
-  auto schedule = normalizeBatchLoopCoordinates(*programLoop, ranges, gridAxis);
-  if (!schedule.axis)
-    return {false, schedule.reason, std::nullopt};
+  auto schedule = normalizeBatchLoopCoordinates(*programLoop, gridAxis);
+  if (!schedule.hasValue())
+    return Result::decline(schedule.diagnostic());
 
   // 两种分布都不跨行：lane u 恒等于原程序 g*F+u，处理的行、顺序、写回的槽位全都
   // 原样不动，所以带多少个归约、带多少条跨行内存依赖都一样逐位一致。
@@ -30,7 +30,7 @@ BatchLoopLegality isSafeToBatchLoop(const BatchLoopFact *programLoop,
   //
   // 替代它们的是关卡 1 里定长分块新增的边界形态要求：段首段尾必须能按 lane 算出
   // 来，否则报 UNPROVEN_LANE_SEGMENT_BOUND。
-  return {true, "", schedule.axis};
+  return Result::success(std::move(schedule).takeValue());
 }
 
 } // namespace mlir::triton::cfg
