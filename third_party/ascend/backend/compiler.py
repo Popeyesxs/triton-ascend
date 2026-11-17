@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import tempfile
 import warnings
+from contextlib import nullcontext
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -2021,9 +2022,16 @@ class AscendBackend(BaseBackend):
         if AscendBackend.instrumentation:
             AscendBackend.instrumentation.load_dialects(ctx)
 
+    def compilation_cache_scope(self, src, key):
+        from triton.runtime.cache import get_cache_manager
+        if hasattr(src, "block_batching_source_hash") and _active_attempt.get() is None:
+            from .block_batching_worker import flat_cache
+            return flat_cache(key)
+        return nullcontext(get_cache_manager(key))
+
     def make_compilation_writer(self, src, options, cache, override_enabled):
         if not hasattr(src, "block_batching_source_hash"):
-            return cache
+            return nullcontext(cache)
         if options.block_batching_factor > 1 and (override_enabled or options.ir_override):
             raise BatchCompileError("unisolated candidate override reached stage writer", stage="config")
         from triton.runtime.cache import FileCacheManager
@@ -2031,9 +2039,9 @@ class AscendBackend(BaseBackend):
             raise BatchCompileError("custom cache reached frozen source writer", stage="config")
         attempt = _active_attempt.get()
         if attempt is not None:
-            return attempt.bind_writer(src, cache, options)
-        import uuid
-        return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
+            return nullcontext(attempt.bind_writer(src, cache, options))
+        from .block_batching_worker import baseline_writer
+        return baseline_writer(cache)
 
     def compile_bundle(self, src, options, compile_variant, *, env_vars=None):
         if options.get("block_batching_factor", 1) != 1:

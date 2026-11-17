@@ -287,9 +287,7 @@ class BatchKernel:
         self._lock = threading.RLock()
         self._ready = False
         self._local = threading.local()
-        self.hash = candidate.hash if candidate is not None else hashlib.sha256(
-            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{IMPLEMENTATION_VERSION}".encode(
-            )).hexdigest()
+        self.hash = candidate.hash if candidate is not None else baseline.hash
         self._set_primary(candidate if candidate is not None else baseline)
         if publish_manifest:
             self.publish_manifest()
@@ -306,7 +304,8 @@ class BatchKernel:
             self.candidate.hash if self.candidate is not None else None, "request":
             {"factor": self.request.factor, "axis": self.request.axis}, "report": self.block_batching
         }
-        get_cache_manager(self.hash).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
+        identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        get_cache_manager(identity).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
 
     def __getattr__(self, name):
         return getattr(self._primary, name)

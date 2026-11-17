@@ -177,8 +177,8 @@ def test_decline_cache_reuses_exact_attempt_and_retries_stale_entries(decline_co
     compile_factor()
     compile_factor()
     assert len(calls) == 1
-    first = next(iter(caches.values()))
-    assert not list((Path(first.cache_dir) / 'attempts').iterdir())
+    first = next(cache for cache in caches.values() if cache.get_file(worker._DECLINE))
+    assert not list((Path(first.cache_dir).parent / '.block-staging').iterdir())
     compile_factor(4)
     compiler.env_vars['test'] = 'changed'
     compile_factor()
@@ -303,10 +303,10 @@ def test_binding_before_index_publish_and_listener_afterwards(bundle_environment
             target='npu', parse_options=lambda opts: SimpleNamespace(block_batching_backend_revision='r',
                                                                      block_compile_context=context)), object(), {})
     index = object()
-    monkeypatch.setattr(worker, '_publish_generation', lambda *args: events.append('index'))
+    monkeypatch.setattr(worker, '_publish_artifacts', lambda *args: events.append('index') or {})
     monkeypatch.setattr(batching.BatchKernel, 'publish_manifest', lambda self: events.append(
         ('bundle', self._contract is not None)))
-    record = {'generation': 'g'}
+    record = {'stage': Path('/private'), 'manifest': {}}
     monkeypatch.setattr(compiler, '_variant', lambda opts, pending: (None, (index, record, {}, 'variant', None)))
     bundle = compiler.compile(env.base, dict(block_batching_factor=3), batching.BatchRequest(3, 0), [0, 1, 2, 3])
     assert bundle.candidate is candidate and candidate.initializations == 0
@@ -409,59 +409,52 @@ def test_worker_knobs_preserve_native_line_info_environment(monkeypatch, raw):
     assert os.environ.get('TRITON_DISABLE_LINE_INFO') == raw
 
 
-def _race_candidate_index(directory, generation, barrier):
+def _stage_group(cache, variant, tag):
     import json
-    from contextlib import ExitStack
+    stage = Path(worker._new_stage(cache).cache_dir)
+    (stage / 'kernel.json').write_text(json.dumps({'generation': tag}))
+    (stage / 'kernel.npubin').write_bytes(b'\x7fELF' + tag.encode())
+    group = {p.name: str(p) for p in stage.iterdir()}
+    return stage, group, worker._artifact_manifest(group, stage, variant)
 
-    variant = 'same-variant'
-    attempt = directory / 'attempts' / generation
-    attempt.mkdir(parents=True)
-    metadata = attempt / 'kernel.json'
-    binary = attempt / 'kernel.npubin'
-    metadata.write_text(json.dumps({'generation': generation}))
-    binary.write_bytes(b'\x7fELF' + generation.encode())
-    files = {p.name: str(p) for p in (metadata, binary)}
-    manifest = worker._artifact_manifest(files, attempt, variant)
-    record = dict(generation=generation, manifest=manifest)
+
+def _race_candidate_index(directory, generation, barrier):
+    cache = SimpleNamespace(cache_dir=str(directory))
     for _ in range(12):
+        stage, group, manifest = _stage_group(cache, 'same-variant', generation)
         barrier.wait(timeout=30)
-        with ExitStack() as pending:
-            worker._publish_generation(SimpleNamespace(cache_dir=directory), record, pending)
+        worker._publish_artifacts(cache, stage, group, manifest)
         barrier.wait(timeout=30)
 
 
-def test_concurrent_publishers_preserve_generation_identity(tmp_path):
+def test_concurrent_publishers_preserve_flat_group_identity(tmp_path):
     import json
     import multiprocessing
-
     context = multiprocessing.get_context('spawn')
     barrier = context.Barrier(3)
+    directory = tmp_path / 'standard-key'
     generations = ['a' * 32, 'b' * 32]
     writers = [
-        context.Process(target=_race_candidate_index, args=(tmp_path, generation, barrier))
+        context.Process(target=_race_candidate_index, args=(directory, generation, barrier))
         for generation in generations
     ]
     for process in writers:
         process.start()
-    index = tmp_path / worker._MANIFEST
     try:
         for i in range(12):
             barrier.wait(timeout=30)
-            # From round 2 a complete prior result is always visible, including
-            # during any concurrent replacement of the public index.
             if i:
-                previous = json.loads(index.read_bytes())
-                assert previous['generation'] in generations
-                worker._checked_group(previous['manifest'], tmp_path / 'attempts' / previous['generation'],
-                                      'same-variant', 'kernel')
+                with worker._cache_lock(directory):
+                    manifest = json.loads((directory / worker._MANIFEST).read_bytes())
+                    worker._checked_group(manifest, directory, 'same-variant', 'kernel')
             barrier.wait(timeout=30)
-            record = json.loads(index.read_bytes())
-            generation = record['generation']
-            assert generation in generations
-            group = worker._checked_group(record['manifest'], tmp_path / 'attempts' / generation, 'same-variant',
-                                          'kernel')
-            assert json.loads(Path(group['kernel.json']).read_text())['generation'] == generation
-            assert Path(group['kernel.npubin']).read_bytes() == b'\x7fELF' + generation.encode()
+            with worker._cache_lock(directory):
+                manifest = json.loads((directory / worker._MANIFEST).read_bytes())
+                group = worker._checked_group(manifest, directory, 'same-variant', 'kernel')
+                generation = json.loads(Path(group['kernel.json']).read_text())['generation']
+                assert generation in generations
+                assert Path(group['kernel.npubin']).read_bytes() == b'\x7fELF' + generation.encode()
+                assert all(Path(p).parent == directory for p in group.values())
     finally:
         for process in writers:
             process.join(timeout=3)
@@ -471,31 +464,113 @@ def test_concurrent_publishers_preserve_generation_identity(tmp_path):
     assert [p.exitcode for p in writers] == [0, 0]
 
 
-@pytest.mark.parametrize("committed", [True, False])
-def test_index_commit_interruption_never_removes_visible_generation(tmp_path, monkeypatch, committed):
-    from contextlib import ExitStack
+@pytest.mark.parametrize('committed', [True, False])
+def test_publication_interruption_preserves_a_complete_flat_group(tmp_path, monkeypatch, committed):
     import json
-    import shutil
-
-    stage = tmp_path / 'private'
-    stage.mkdir()
-    manifest = tmp_path / worker._MANIFEST
-    manifest.write_text('{"generation": "previous"}')
+    cache = SimpleNamespace(cache_dir=str(tmp_path / 'standard-key'))
+    previous, group, manifest = _stage_group(cache, 'variant', 'old')
+    worker._publish_artifacts(cache, previous, group, manifest)
+    stage, group, manifest = _stage_group(cache, 'variant', 'new')
+    inode = (stage / 'kernel.npubin').stat().st_ino
     replace = Path.replace
 
     def interrupted(path, target):
-        if committed:
-            replace(path, target)
-            raise KeyboardInterrupt
-        raise PermissionError('rename denied')
+        if path == stage:
+            if committed:
+                replace(path, target)
+                raise KeyboardInterrupt
+            raise PermissionError('rename denied')
+        return replace(path, target)
 
-    monkeypatch.setattr(Path, "replace", interrupted)
-    expected = KeyboardInterrupt if committed else PermissionError
-    with pytest.raises(expected), ExitStack() as pending:
-        pending.callback(shutil.rmtree, stage)
-        worker._publish_generation(SimpleNamespace(cache_dir=tmp_path), {"generation": stage.name}, pending)
-    assert json.loads(manifest.read_text())['generation'] == (stage.name if committed else 'previous')
-    assert stage.exists() == committed
+    monkeypatch.setattr(Path, 'replace', interrupted)
+    with pytest.raises(KeyboardInterrupt if committed else PermissionError):
+        worker._publish_artifacts(cache, stage, group, manifest)
+    worker._remove_stage(stage)
+    directory = Path(cache.cache_dir)
+    with worker._cache_lock(directory):
+        manifest = json.loads((directory / worker._MANIFEST).read_bytes())
+        group = worker._checked_group(manifest, directory, 'variant', 'kernel')
+        assert json.loads(Path(group['kernel.json']).read_text())['generation'] == ('new' if committed else 'old')
+        if committed:
+            assert Path(group['kernel.npubin']).stat().st_ino == inode
+        assert json.loads((directory / '__grp__kernel.json').read_text())['child_paths'] == group
+
+
+def test_directory_recovery_after_writer_disappears(tmp_path):
+    cache = SimpleNamespace(cache_dir=str(tmp_path / 'standard-key'))
+    stage, group, manifest = _stage_group(cache, 'variant', 'old')
+    worker._publish_artifacts(cache, stage, group, manifest)
+    directory = Path(cache.cache_dir)
+    previous = directory.parent / '.block-staging' / (directory.name + '.previous')
+    directory.replace(previous)
+    # No exception handler or finally block ran in the vanished publisher.
+    with worker._cache_lock(directory):
+        assert (directory / 'kernel.npubin').read_bytes() == b'\x7fELFold'
+        assert not previous.exists()
+
+
+def test_flat_candidate_cache_hit_force_compile_and_corruption(decline_compiler, monkeypatch):
+    import json
+    from contextlib import ExitStack
+    from triton import knobs
+    compiler, _ = decline_compiler
+    calls = []
+
+    def attempt(operation, body):
+        calls.append(body['variant'])
+        stage = Path(body['stage_key'])
+        (stage / 'kernel.json').write_text('{}')
+        (stage / 'kernel.npubin').write_bytes(b'\x7fELFbinary')
+        group = {p.name: str(p) for p in stage.iterdir()}
+        return SimpleNamespace(
+            status='Success', payload=dict(manifest=worker._artifact_manifest(group, stage, body['variant']),
+                                           timings={}))
+
+    monkeypatch.setattr(worker, '_attempt', attempt)
+    for force in (False, False, True):
+        knobs.compilation.always_compile = force
+        with ExitStack() as pending:
+            refusal, result = compiler._variant(dict(block_batching_factor=2), pending)
+            assert refusal is None
+            cache, record, group, _, _ = result
+            if record is not None:
+                group = worker._publish_artifacts(cache, record['stage'], group, record['manifest'])
+            assert all(Path(p).parent == Path(cache.cache_dir) for p in group.values())
+            assert json.loads(Path(cache.get_file('__grp__kernel.json')).read_text())['child_paths'] == group
+    assert len(calls) == 2
+    knobs.compilation.always_compile = False
+    with ExitStack() as pending:
+        assert compiler._variant(dict(block_batching_factor=2), pending, cached_only=True)[1] is not None
+    Path(group['kernel.npubin']).write_bytes(b'corrupt')
+    with ExitStack() as pending, pytest.raises(worker.BatchCompileError, match='InvalidArtifact'):
+        compiler._variant(dict(block_batching_factor=2), pending)
+    assert len(calls) == 2
+
+
+def test_baseline_writer_publishes_standard_paths_and_cleans_failure(tmp_path, monkeypatch):
+    from triton.runtime.cache import FileCacheManager
+    compiler_api = ModuleType('triton.compiler.compiler')
+    compiler_api.CompiledKernel = lambda src, group, key: SimpleNamespace(
+        metadata=SimpleNamespace(hash=key), metadata_group=group, kernel=Path(group['kernel.npubin']).read_bytes())
+    monkeypatch.setitem(sys.modules, 'triton.compiler.compiler', compiler_api)
+    cache = FileCacheManager(str(tmp_path / 'standard-key'))
+    with worker.baseline_writer(cache) as writer:
+        group = {
+            'kernel.json': writer.put('{}', 'kernel.json'), 'kernel.npubin':
+            writer.put(b'\x7fELFbaseline', 'kernel.npubin')
+        }
+        stage = Path(writer.cache_dir)
+        inode = Path(group['kernel.npubin']).stat().st_ino
+        result = writer.commit(object(), group, 'variant')
+    assert not stage.exists()
+    assert result.kernel == b'\x7fELFbaseline'
+    assert Path(result.metadata_group['kernel.npubin']).stat().st_ino == inode
+    assert result.metadata_group == cache.get_group('kernel.json')
+    with pytest.raises(RuntimeError), worker.baseline_writer(cache) as failed:
+        failed.put(b'partial', 'kernel.npubin')
+        raise RuntimeError('compile failed')
+    assert not Path(failed.cache_dir).exists()
+    assert Path(result.metadata_group['kernel.npubin']).read_bytes() == result.kernel
 
 
 def test_analysis_binding_alias_and_isolated_report_listener(monkeypatch):
