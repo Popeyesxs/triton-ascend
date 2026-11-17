@@ -524,10 +524,13 @@ def _cache_lock(directory):
 @contextmanager
 def flat_cache(variant):
     from triton import knobs
-    from triton.runtime.cache import get_cache_manager, _base32
+    from triton.runtime.cache import FileCacheManager, get_cache_manager, _base32
     directory = Path(knobs.cache.dir).resolve() / _base32(variant)
     with _cache_lock(directory):
-        yield get_cache_manager(variant)
+        cache = get_cache_manager(variant)
+        if type(cache) is not FileCacheManager or Path(cache.cache_dir).resolve() != directory:
+            raise BatchCompileError('nonlocal block cache', kind='InvalidArtifact', stage='cache')
+        yield cache
 
 
 def _new_stage(cache):

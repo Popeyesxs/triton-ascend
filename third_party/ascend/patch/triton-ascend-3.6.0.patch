@@ -640,7 +640,7 @@ index c572f81e3..4b4332368 100644
  
  
 diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
-index d4872a4..8bd7992 100644
+index d4872a4..c75fff2 100644
 --- a/python/triton/compiler/compiler.py
 +++ b/python/triton/compiler/compiler.py
 @@ -1,4 +1,5 @@
@@ -720,26 +720,36 @@ index d4872a4..8bd7992 100644
      # For dumping/overriding only hash the source as we want it to be independent of triton
      # core changes to make it easier to track kernels by hash.
      enable_override = knobs.compilation.override
-@@ -259,105 +301,137 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -259,14 +301,19 @@ def compile(src, target=None, options=None, _env_vars=None):
      # the file name to 150 characters to be safe.
      file_name = src.name[:150]
      metadata_filename = f"{file_name}.json"
 -    metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
 -    metadata_path = metadata_group.get(metadata_filename)
 -    always_compile = knobs.compilation.always_compile
--    if not always_compile and metadata_path is not None:
++    cache_scope = getattr(backend, "compilation_cache_scope", None)
++    with (cache_scope(src, hash) if cache_scope is not None else nullcontext(get_cache_manager(hash))) as fn_cache_manager:
++        metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
++        metadata_path = metadata_group.get(metadata_filename)
++        always_compile = knobs.compilation.always_compile
++        if not always_compile and metadata_path is not None:
++            # cache hit!
++            res = CompiledKernel(src, metadata_group, hash)
++
+     if not always_compile and metadata_path is not None:
 -        # cache hit!
 -        res = CompiledKernel(src, metadata_group, hash)
--        if compilation_listener:
+         if compilation_listener:
 -            compilation_listener(
--                src=src,
--                metadata=res.metadata._asdict(),
--                metadata_group=metadata_group,
--                times=timer.end(),
--                cache_hit=True,
--            )
--        return res
--
++            _notify_compilation_listener(
++                compilation_listener,
+                 src=src,
+                 metadata=res.metadata._asdict(),
+                 metadata_group=metadata_group,
+@@ -275,89 +322,118 @@ def compile(src, target=None, options=None, _env_vars=None):
+             )
+         return res
+ 
 -    # initialize metadata
 -    metadata = {
 -        "hash": hash,
@@ -777,25 +787,6 @@ index d4872a4..8bd7992 100644
 -    else:
 -        ir_filename = f"{file_name}.source"
 -        metadata_group[ir_filename] = fn_cache_manager.put(module, ir_filename)
-+    cache_scope = getattr(backend, "compilation_cache_scope", None)
-+    with (cache_scope(src, hash) if cache_scope is not None else nullcontext(get_cache_manager(hash))) as fn_cache_manager:
-+        metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
-+        metadata_path = metadata_group.get(metadata_filename)
-+        always_compile = knobs.compilation.always_compile
-+        if not always_compile and metadata_path is not None:
-+            # cache hit!
-+            res = CompiledKernel(src, metadata_group, hash)
-+            if compilation_listener:
-+                _notify_compilation_listener(
-+                    compilation_listener,
-+                    src=src,
-+                    metadata=res.metadata._asdict(),
-+                    metadata_group=metadata_group,
-+                    times=timer.end(),
-+                    cache_hit=True,
-+                )
-+            return res
-+
 +    writer_factory = getattr(backend, "make_compilation_writer", None)
 +    writer_context = (writer_factory(src, options, fn_cache_manager, enable_override)
 +                      if writer_factory is not None else nullcontext(fn_cache_manager))
@@ -933,7 +924,7 @@ index d4872a4..8bd7992 100644
 +        commit = getattr(stage_cache_manager, "commit", None)
 +        if commit is None:
 +            fn_cache_manager.put_group(metadata_filename, metadata_group)
-+            result = CompiledKernel(src, metadata_group, hash)
++            result = None
 +        else:
 +            result = commit(src, metadata_group, hash)
 +            metadata_group = result.metadata_group
@@ -949,11 +940,11 @@ index d4872a4..8bd7992 100644
 +            _notify_compilation_listener(compilation_listener, src=src, metadata=metadata, metadata_group=metadata_group,
 +                                         times=timer.end(), cache_hit=False)
 +        # return handle to compiled kernel
-+        return result
++        return result if result is not None else CompiledKernel(src, metadata_group, hash)
  
  
  def make_backend(target: GPUTarget) -> BaseBackend:
-@@ -402,7 +476,9 @@ def _raise_error(err, *args, **kwargs):
+@@ -402,7 +478,9 @@ def _raise_error(err, *args, **kwargs):
  
  
  class CompiledKernel:
@@ -964,7 +955,7 @@ index d4872a4..8bd7992 100644
      def __init__(self, src, metadata_group, hash):
          from collections import namedtuple
          metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-@@ -432,8 +508,33 @@ class CompiledKernel:
+@@ -432,8 +510,33 @@ class CompiledKernel:
          self.module = None
          self.function = None
          self._run = None
@@ -998,7 +989,7 @@ index d4872a4..8bd7992 100644
          if self.module is not None:
              return
  
-@@ -459,20 +560,19 @@ class CompiledKernel:
+@@ -459,20 +562,19 @@ class CompiledKernel:
              max_tmem_size = 512  # tmem size in number of columns
              if self.metadata.tmem_size > max_tmem_size:
                  raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))

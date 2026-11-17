@@ -137,13 +137,13 @@ def test_checked_generation_rejects_lost_or_changed_binary(tmp_path):
 @pytest.fixture
 def decline_compiler(tmp_path, monkeypatch):
     import triton
-    from triton.runtime.cache import FileCacheManager
+    from triton.runtime.cache import get_cache_manager
     monkeypatch.setattr(worker, '_variant_key', lambda src, backend, opts, env: worker._digest([vars(opts), env]))
     monkeypatch.setattr(worker, '_worker_request', lambda backend, src, opts, env, key: dict(variant=key))
     caches = {}
 
     def cache(key):
-        return caches.setdefault(key, FileCacheManager(key))
+        return caches.setdefault(key, get_cache_manager(key))
 
     monkeypatch.setattr(triton.runtime.cache, 'get_cache_manager', cache)
     compiler = worker.CandidateCompiler(SimpleNamespace(parse_options=lambda opts: SimpleNamespace(**opts)),
