@@ -334,7 +334,7 @@ def test_binding_before_index_publish_and_listener_afterwards(bundle_environment
     candidate.metadata = candidate.metadata._replace(block_compile_context=('Ascend950', 12, (True, 12, 24), None))
     with pytest.raises(worker.BatchCompileError, match='InvalidArtifact'):
         compiler.compile(env.base, dict(block_batching_factor=3), batching.BatchRequest(3, 0), [0, 1, 2, 3])
-    assert not events
+    assert events == ['read released']
 
 
 def test_worker_spawn_failure_is_structured(tmp_path):
