@@ -287,13 +287,13 @@ class BatchKernel:
         self._lock = threading.RLock()
         self._ready = False
         self._local = threading.local()
-        self.hash = candidate.hash if candidate is not None else baseline.hash
         self._set_primary(candidate if candidate is not None else baseline)
         if publish_manifest:
             self.publish_manifest()
 
     def _set_primary(self, kernel):
         self._primary = kernel
+        self.hash = kernel.hash
         fields = dict(kernel.metadata._asdict(), block_batching=self.block_batching)
         self.metadata = namedtuple("BatchKernelMetadata", sorted(fields))(**fields)
 

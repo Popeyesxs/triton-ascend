@@ -249,6 +249,15 @@ def test_failed_binding_does_not_publish(bundle_environment, monkeypatch):  # no
     assert not published
 
 
+def test_fallback_bundle_keeps_the_executable_cache_identity(bundle_environment):  # noqa: F811
+    env = bundle_environment
+    result = batching.BatchKernel(env.base, None, batching.BatchRequest(4, 0),
+                                  dict(compile_status='REJECTED', cv_mode='disabled'), ())
+    assert result.hash == env.base.hash and result._primary is env.base
+    result._set_primary(env.candidate)
+    assert result.hash == env.candidate.hash and result._primary is env.candidate
+
+
 def test_valid_unsupported_lowering_and_corrupt_evidence_are_distinct(compile_errors):
     report = dict(
         owner='block_batching', cv_mode='disabled', lane_width=4, layout={
@@ -307,14 +316,20 @@ def test_binding_before_index_publish_and_listener_afterwards(bundle_environment
     monkeypatch.setattr(batching.BatchKernel, 'publish_manifest', lambda self: events.append(
         ('bundle', self._contract is not None)))
     record = {'stage': Path('/private'), 'manifest': {}}
-    monkeypatch.setattr(compiler, '_variant', lambda opts, pending: (None, (index, record, {}, 'variant', None)))
+
+    def variant(opts, pending):
+        if record is None:
+            pending.callback(lambda: events.append('read released'))
+        return None, (index, record, {}, 'variant', None)
+
+    monkeypatch.setattr(compiler, '_variant', variant)
     bundle = compiler.compile(env.base, dict(block_batching_factor=3), batching.BatchRequest(3, 0), [0, 1, 2, 3])
     assert bundle.candidate is candidate and candidate.initializations == 0
     assert events == ['index', ('bundle', True), ('listener', False)]
     events.clear()
     record = None
     compiler.compile(env.base, dict(block_batching_factor=3), batching.BatchRequest(3, 0), [0, 1, 2, 3])
-    assert events == [('bundle', True), ('listener', True)]
+    assert events == ['read released', ('bundle', True), ('listener', True)]
     events.clear()
     candidate.metadata = candidate.metadata._replace(block_compile_context=('Ascend950', 12, (True, 12, 24), None))
     with pytest.raises(worker.BatchCompileError, match='InvalidArtifact'):
@@ -554,9 +569,10 @@ def test_baseline_writer_publishes_standard_paths_and_cleans_failure(tmp_path, m
         metadata=SimpleNamespace(hash=key), metadata_group=group, kernel=Path(group['kernel.npubin']).read_bytes())
     monkeypatch.setitem(sys.modules, 'triton.compiler.compiler', compiler_api)
     cache = FileCacheManager(str(tmp_path / 'standard-key'))
+    old_ir = cache.put('old IR', 'kernel.ttadapter')
     with worker.baseline_writer(cache) as writer:
         group = {
-            'kernel.json': writer.put('{}', 'kernel.json'), 'kernel.npubin':
+            'kernel.ttadapter': old_ir, 'kernel.json': writer.put('{}', 'kernel.json'), 'kernel.npubin':
             writer.put(b'\x7fELFbaseline', 'kernel.npubin')
         }
         stage = Path(writer.cache_dir)
@@ -566,6 +582,7 @@ def test_baseline_writer_publishes_standard_paths_and_cleans_failure(tmp_path, m
     assert result.kernel == b'\x7fELFbaseline'
     assert Path(result.metadata_group['kernel.npubin']).stat().st_ino == inode
     assert result.metadata_group == cache.get_group('kernel.json')
+    assert 'kernel.ttadapter' not in result.metadata_group and not Path(old_ir).exists()
     with pytest.raises(RuntimeError), worker.baseline_writer(cache) as failed:
         failed.put(b'partial', 'kernel.npubin')
         raise RuntimeError('compile failed')

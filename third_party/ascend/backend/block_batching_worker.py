@@ -576,10 +576,14 @@ class _BaselineWriter:
 
     def commit(self, source, group, variant):
         from triton.compiler.compiler import CompiledKernel
+        stage = Path(self.writer.cache_dir)
+        # Forced compilation can inherit old IR entries from get_group(). Only
+        # files produced in this attempt belong to the replacement directory.
+        group = {name: path for name, path in group.items() if Path(path).parent == stage}
         result = CompiledKernel(source, group, variant)
         if result.metadata.hash != variant:
             raise BatchCompileError('baseline artifact identity mismatch', kind='InvalidArtifact', stage='cache')
-        result.metadata_group = _publish_artifacts(self.cache, Path(self.writer.cache_dir), group)
+        result.metadata_group = _publish_artifacts(self.cache, stage, group)
         return result
 
 
