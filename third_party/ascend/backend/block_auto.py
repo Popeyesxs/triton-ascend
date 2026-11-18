@@ -190,7 +190,11 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     from triton import knobs
 
     common = {k: v for k, v in options.items() if k not in ("block_auto_contract", "block_batching_grid")}
-    baseline_options = dict(common, block_batching_factor=1, block_batching_axis=-1)
+    # F1 is the ordinary artifact. The parent-resolved device snapshot only
+    # spares the candidate worker a device query the parent repeats here, so
+    # keeping it would split F1 away from the entry a plain launch or a warmup
+    # writes, and no automatic launch would ever hit the compilation cache.
+    baseline_options = dict(common, block_batching_factor=1, block_batching_axis=-1, block_compile_context=None)
     if not options.get("block_auto_contract"):
         return compile_variant(baseline_options)
     contract = json.loads(options["block_auto_contract"])
@@ -257,8 +261,13 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
     factor, axis = selection["factor"], selection["selected_axis"]
     if type(factor) is not int or factor not in (1, 2, 4) or (factor > 1 and axis not in (0, 1, 2)):
         raise BatchCompileError("invalid TTIR selection", kind="ProtocolError", stage="select")
-    baseline = compile_variant(baseline_options, frozen)
-    if baseline.hash != _variant_key(frozen, backend, backend.parse_options(baseline_options), env_vars):
+    # The frozen source exists to give the candidate a byte-identical reference,
+    # and it carries a cache identity of its own. Without a candidate to compare
+    # against, F1 is the ordinary artifact, so compiling it from the original
+    # source keeps the entry an ordinary launch or a warmup already wrote.
+    baseline = compile_variant(baseline_options, frozen if factor > 1 else None)
+    if factor > 1 and baseline.hash != _variant_key(frozen, backend, backend.parse_options(baseline_options),
+                                                    env_vars):
         raise BatchCompileError("baseline cache identity changed", kind="InvalidArtifact", stage="bind")
     result, declines = None, []
     if factor > 1:
