@@ -628,7 +628,7 @@ class TestHostIntegration(unittest.TestCase):
         self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
                                        prepare_block_compile_options=lambda values, **_: dict(values))
         self.fn = SimpleNamespace(fn=lambda: None, arg_names=["x", "size", "BLOCK"],
-                                  device_caches={0: [{}, None, None, None, self.bind]})
+                                  device_caches={0: [{}, {}, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
 
@@ -680,7 +680,9 @@ class TestHostIntegration(unittest.TestCase):
 
         def launch(*args, grid, **options):
             prepared, _ = self.dispatch.prepare_launch(self.fn, args, options, grid, False, 0, self.backend)
-            seen.append(prepared["block_batching_factor"])
+            # An omitted factor is the ordinary compilation, which the option
+            # default already spells as 1, so the key stays out of the options.
+            seen.append(prepared.get("block_batching_factor", 1))
             return prepared
 
         def bench(fn, quantiles):
@@ -748,7 +750,7 @@ class TestHostIntegration(unittest.TestCase):
                 self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], "auto")
             self.assertIs(autotuner._autotuning_kernel.get(), self.fn.fn)
             self.run_handler()
-            self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", self.calls[-1][0][1])
             self.fn.arg_names.append("block_batching_factor")
             options, _ = self.dispatch.prepare_launch(self.fn, (), self.kwargs, (256, ), True, 0, self.backend)
             self.assertIs(options, self.kwargs)  # A kernel argument is not a compiler option.
@@ -783,7 +785,7 @@ class TestHostIntegration(unittest.TestCase):
             else:
                 self.assertEqual(self.calls[0][0][1], dict(self.kwargs, block_compile_context=context))
                 self.backend.prepare_block_compile_options.assert_called_once_with(self.kwargs,
-                                                                                   cache=self.fn.device_caches[0][0])
+                                                                                   cache=self.fn.device_caches[0][1])
 
     def test_warmup_uses_the_same_contract_as_launch(self):
         self.kwargs.pop("block_batching_factor")
@@ -795,7 +797,7 @@ class TestHostIntegration(unittest.TestCase):
         incomplete = SimpleNamespace(dtype="fp32", shape=(1, ), stride=lambda: (1, ))
         options, _ = self.dispatch.prepare_launch(self.fn, (incomplete, 131072), self.kwargs, (256, ), True, 0,
                                                   self.backend)
-        self.assertEqual(options["block_batching_factor"], 1)
+        self.assertNotIn("block_batching_factor", options)
         self.assertNotIn("block_auto_contract", options)
 
     def test_capture_uses_baseline_without_binding_or_grid_evaluation(self):
@@ -810,7 +812,7 @@ class TestHostIntegration(unittest.TestCase):
             self.run_handler(unavailable, warmup)
             self.assertEqual(len(self.calls), 1)
             values, _ = self.calls[0]
-            self.assertEqual(values[1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", values[1])
             self.assertIs(values[2], unavailable)
 
     def test_non_a5_and_invalid_grid_keep_baseline(self):
@@ -819,7 +821,7 @@ class TestHostIntegration(unittest.TestCase):
             self.backend.target.arch = target
             self.calls.clear()
             self.run_handler(grid)
-            self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", self.calls[-1][0][1])
 
     def test_a3_enters_auto_without_a5_empirical_override(self):
         self.backend.target.arch = "Ascend910_9391"
@@ -834,7 +836,7 @@ class TestHostIntegration(unittest.TestCase):
             self.calls.clear()
             self.run_handler(grid)
             options = self.calls[-1][0][1]
-            self.assertEqual(options["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", options)
             self.assertNotIn("block_auto_contract", options)
 
     def test_other_frontends_keep_their_original_compilation_path(self):
@@ -842,7 +844,7 @@ class TestHostIntegration(unittest.TestCase):
         self.kwargs.pop("block_batching_factor")
         self.run_handler()
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0][0][1]["block_batching_factor"], 1)
+        self.assertNotIn("block_batching_factor", self.calls[0][0][1])
 
     def test_shape_and_scalar_values_are_part_of_jit_option_identity(self):
         first, _ = self.dispatch.prepare_launch(self.fn, (Tensor(), 131072), self.kwargs, (256, ), False, 0,
@@ -858,7 +860,7 @@ class TestHostIntegration(unittest.TestCase):
         def reuse(fn, args, kwargs, grid, warmup, device, stream, backend, tail):
             self.assertIs(fn, self.fn)
             self.assertNotIn("block_auto_contract", kwargs)
-            self.assertEqual(kwargs["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", kwargs)
             return tail(args, kwargs, grid, warmup, device, stream)
 
         with patch.dict(sys.modules,

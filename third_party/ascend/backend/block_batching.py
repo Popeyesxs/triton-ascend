@@ -95,14 +95,25 @@ def _argument(value):
     return dict(kind="unsupported")
 
 
-def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
+def prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=None):
+    """Resolve the automatic launch contract before the ordinary JIT lookup.
+
+    ``binding`` optionally collects the argument binding performed here. It is
+    taken before any option is injected, so it carries the ordinary cache
+    identity, and it stays empty on paths that must not bind, such as capture.
+    """
     if "block_batching_factor" in fn.arg_names or kwargs.get("block_batching_factor", "auto") != "auto":
         return kwargs, grid
     from .reuse.config import enabled as reuse_enabled
 
     def baseline():
-        result = dict(kwargs, block_batching_factor=1)
+        # Only an omitted or automatic factor reaches this point, and both mean
+        # the ordinary compilation. Dropping the key keeps that launch on the
+        # ordinary JIT cache identity instead of splitting it, while an omitted
+        # and an explicit "auto" factor still resolve to the same options.
+        result = dict(kwargs)
         result.pop("block_auto_contract", None)
+        result.pop("block_batching_factor", None)
         return result, grid
 
     from triton.runtime.autotuner import _autotuning_kernel
@@ -111,10 +122,17 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
 
     # Dynamic reuse owns constexpr/tile adaptation and must receive the original
     # callable grid. A concrete auto contract would split its variant families.
+    # Compile-only runs have no device to resolve the selection inputs from, so
+    # an automatic launch there is an ordinary one rather than a hard error.
+    from triton import knobs
+
     if (reuse_enabled() or getattr(getattr(fn, "ASTSource", None), "frontend_kind", "triton") != "triton"
-            or not supports_target(backend.target.arch) or _capture_state() is not False):
+            or not supports_target(backend.target.arch) or _capture_state() is not False
+            or knobs.ascend.compile_only):
         return baseline()
-    bound, specialization, _ = fn.device_caches[device][4](*args, **kwargs)
+    bound, specialization, clean_options = fn.device_caches[device][4](*args, **kwargs)
+    if binding is not None:
+        binding.update(specialization=specialization, options=clean_options)
     if callable(grid):
         grid = grid(bound)
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3 or any(
@@ -180,13 +198,17 @@ class _BatchLaunchHandler:
     """Block-batching policy behind the existing backend JIT continuation."""
 
     def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail):
-        kwargs, grid = prepare_launch(fn, args, kwargs, grid, warmup, device, backend)
+        binding = {}
+        kwargs, grid = prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=binding)
         # Preserve pre-run hooks, cache identity and single callback evaluation
         # without adding a hook to the common JIT frontend.
         bind = None if warmup else lambda: fn.device_caches[device][4](*args, **kwargs)[0]
         grid = _annotate_launch_grid(kwargs, grid, bind=bind)
+        # Both memos below are bookkeeping, not compiled kernels, so they live in
+        # the key cache rather than the kernel cache. Both device slots share one
+        # lifetime, while the kernel cache stays one entry per compiled kernel.
         if "block_batching_factor" not in fn.arg_names and kwargs.get("block_batching_factor", 1) != 1:
-            kwargs = backend.prepare_block_compile_options(kwargs, cache=fn.device_caches[device][0])
+            kwargs = backend.prepare_block_compile_options(kwargs, cache=fn.device_caches[device][1])
         from .reuse.config import enabled
 
         if enabled():
@@ -194,8 +216,17 @@ class _BatchLaunchHandler:
 
             return get_handler().run(fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail)
         if kwargs.get("block_batching_factor") == "auto":
-            cache = fn.device_caches[device][0]
-            return jit_tail(args, kwargs, grid, warmup, device, stream,
+            cache = fn.device_caches[device][1]
+            # The contract reaches compilation through the options, but it
+            # describes one launch, not the artifact. Keeping it out of the
+            # cache identity stops every new shape from re-entering compile().
+            memory_key = None
+            if binding:
+                from triton.runtime.jit import compute_cache_key
+
+                memory_key = compute_cache_key(fn.device_caches[device][1], binding["specialization"],
+                                               binding["options"])
+            return jit_tail(args, kwargs, grid, warmup, device, stream, memory_key=memory_key,
                             initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
         return jit_tail(args, kwargs, grid, warmup, device, stream)
 

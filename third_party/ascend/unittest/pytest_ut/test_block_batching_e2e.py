@@ -259,7 +259,9 @@ class TestVV:
 
         def observe(*args, **kwargs):
             prepared = original(*args, **kwargs)
-            seen.append(prepared[0]['block_batching_factor'])
+            # An omitted factor is the ordinary compilation, which the option
+            # default already spells as 1, so the key stays out of the options.
+            seen.append(prepared[0].get('block_batching_factor', 1))
             return prepared
 
         with patch.object(block_batching, 'prepare_launch', observe):
