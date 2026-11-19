@@ -25,7 +25,11 @@ _MANIFEST = 'block_batching.artifacts'
 _DECLINE = 'block_batching.decline'
 # Extend only for audited, deterministic TTIR failures. Resource limits,
 # analysis budgets and abnormal worker exits must remain retryable.
-_CACHEABLE_DECLINES = frozenset({'UNSUPPORTED_ADDRESS_EXPRESSION'})
+_CACHEABLE_DECLINES = frozenset({'UNSUPPORTED_ADDRESS_EXPRESSION', 'UNSUPPORTED_BYTE_OPERATION'})
+# Cost model limits reported by scoring itself. These are raised while reading
+# the TTIR, so the same module always reaches the same limit, and the request
+# identity carries the backend revision the model ships with.
+_DETERMINISTIC_MODEL_LIMITS = frozenset({'dynamic loop trip count in TTIR cost model'})
 _BOOTSTRAP = ('import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); '
               'import site; site.main(); from triton.backends.ascend.block_batching_worker import _worker; _worker()')
 

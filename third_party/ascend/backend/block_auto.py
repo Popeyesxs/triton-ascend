@@ -14,13 +14,32 @@ class _SelectionMiss(Exception):
     """A cached decision has neither a binary nor a usable TTIR snapshot."""
 
 
+def _cacheable_candidate(row):
+    """Whether this candidate reaches the same outcome on the same inputs."""
+    from .block_batching_worker import _CACHEABLE_DECLINES, _DETERMINISTIC_MODEL_LIMITS
+    status = row.get("status")
+    if status == "TTIR_COST_ESTIMATED":
+        return True
+    # _NotApplicable carries a modeled decline reason, never a frontend crash.
+    if status == "COMPILE_REJECTED":
+        return row.get("error") in _CACHEABLE_DECLINES
+    # A limit of the cost model is a property of the TTIR, and the request
+    # identity already covers the backend revision that model ships with.
+    if status == "TTIR_MODEL_UNSUPPORTED":
+        return row.get("error") in _DETERMINISTIC_MODEL_LIMITS
+    return False
+
+
 def _cacheable_selection(report):
     from .block_batching_worker import _cacheable_decline
     selection = report["selection"]
-    # model_complete only guarantees a baseline score. Do not turn unmodeled
-    # candidates or unaudited refusals into a persistent F1 decision.
-    return (selection.get("model_complete") is True and not selection.get("failure_kind")
-            and all(row.get("status") == "TTIR_COST_ESTIMATED" for row in selection["candidates"].values()) and all(
+    # A decision persists when every outcome behind it reproduces, not only
+    # when the model priced everything. A kernel the model cannot price is a
+    # stable fact about that kernel, so each process rediscovering it buys
+    # nothing. Resource limits and abnormal exits still arrive as a
+    # failure_kind and stay retryable.
+    return (not selection.get("failure_kind")
+            and all(_cacheable_candidate(row) for row in selection["candidates"].values()) and all(
                 _cacheable_decline({k: v
                                     for k, v in decline.items()
                                     if k not in ("factor", "axis")})

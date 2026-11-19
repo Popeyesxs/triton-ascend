@@ -368,18 +368,37 @@ class TestSelectionCache(unittest.TestCase):
         with self.assertRaises(self.auto._SelectionMiss):
             self.cache.restore_ttir(prepared, restored)
 
-    def test_incomplete_models_and_unaudited_refusals_are_not_cached(self):
-        for change in ("model", "failure", "candidate", "decline"):
+    def test_retryable_outcomes_and_unaudited_refusals_are_not_cached(self):
+        for change in ("failure", "candidate", "model_limit", "rejection", "decline"):
             report = selection_report(1)
-            if change == "model":
-                report["selection"]["model_complete"] = False
-            elif change == "failure":
+            candidate = report["selection"]["candidates"]["unmerged"]
+            if change == "failure":
                 report["selection"]["failure_kind"] = "Timeout"
             elif change == "candidate":
-                report["selection"]["candidates"]["unmerged"]["status"] = "TTIR_MODEL_UNSUPPORTED"
+                candidate["status"] = "TTIR_MODEL_UNSUPPORTED"
+            elif change == "model_limit":
+                candidate.update(status="TTIR_MODEL_UNSUPPORTED", error="analysis budget exhausted")
+            elif change == "rejection":
+                candidate.update(status="COMPILE_REJECTED", error="UNSUPPORTED_BATCH_OP")
             else:
                 report["plan"]["declines"] = [dict(axis=0, factor=2, stage="ttir", reason="UNSUPPORTED_BATCH_OP")]
-            self.assertFalse(self.auto._cacheable_selection(report))
+            with self.subTest(change=change):
+                report["selection"]["model_complete"] = False
+                self.assertFalse(self.auto._cacheable_selection(report))
+
+    def test_audited_deterministic_outcomes_are_cached_without_a_priced_baseline(self):
+        from triton.backends.ascend.block_batching_worker import _CACHEABLE_DECLINES, _DETERMINISTIC_MODEL_LIMITS
+        # A kernel the model cannot price reaches the same verdict every time,
+        # so the decision persists instead of being rediscovered per process.
+        report = selection_report(1)
+        report["selection"].update(model_complete=False, reason="TTIR_BASELINE_MODEL_UNSUPPORTED")
+        report["selection"]["candidates"]["unmerged"].update(status="TTIR_MODEL_UNSUPPORTED",
+                                                             error=sorted(_DETERMINISTIC_MODEL_LIMITS)[0])
+        report["selection"]["candidates"]["a0_f2"] = dict(factor=2, axis=0, requested_axis=0, status="COMPILE_REJECTED",
+                                                          error="UNSUPPORTED_BYTE_OPERATION")
+        report["plan"]["declines"] = [dict(axis=0, factor=2, stage="ttir", reason="UNSUPPORTED_BYTE_OPERATION")]
+        self.assertIn("UNSUPPORTED_BYTE_OPERATION", _CACHEABLE_DECLINES)
+        self.assertTrue(self.auto._cacheable_selection(report))
 
 
 class TestCompileContextCache(unittest.TestCase):
